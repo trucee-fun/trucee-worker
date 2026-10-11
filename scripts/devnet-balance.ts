@@ -3,11 +3,13 @@
  * Read-only (getMultipleAccounts only, 100 keys per call). Prints public keys and SOL; never secret keys
  * and never the RPC URL.
  *
- * Usage (from worker/, after sourcing litesvm-diff/.env without echo):
- *   RPC_URL="$DEVNET_RPC" npx tsx scripts/devnet-balance.ts
+ * Usage (from worker/; the URL only reaches this process, never argv or your shell):
+ *   node --env-file=<main checkout>/litesvm-diff/.env --import tsx scripts/devnet-balance.ts
+ *   (set -a; . <main checkout>/litesvm-diff/.env; set +a; RPC_URL="$DEVNET_RPC" npx tsx scripts/devnet-balance.ts)
  *
  * Env:
- *   RPC_URL        http(s) RPC endpoint (required, never printed)
+ *   RPC_URL        RPC endpoint, falls back to DEVNET_RPC (required, never printed). Must be https,
+ *                  except http://localhost and http://127.0.0.1
  *   TRADERS_DIRS   comma-separated directories scanned for *.traders.json
  *                  (default: <repo>/worker/out,<repo>/litesvm-diff/out)
  *   PAYER_KEYPAIR  payer keypair file, only its public key is derived (default ~/.config/solana/id.json)
@@ -27,6 +29,8 @@ const SECRET_KEY_BYTES = 64
 const BYTE_MAX = 255
 const MAX_ERROR_CHARS = 300
 const MIN_SECRET_FRAGMENT = 8
+/** The only hosts allowed over plain http: a local validator. */
+const LOCAL_HTTP_HOSTS = new Set(['localhost', '127.0.0.1'])
 const TRADERS_SUFFIX = '.traders.json'
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const DEFAULT_TRADERS_DIRS = [join(REPO_ROOT, 'worker', 'out'), join(REPO_ROOT, 'litesvm-diff', 'out')]
@@ -54,20 +58,32 @@ interface TradersScan {
   readonly problems: readonly string[]
 }
 
-/** Validates RPC_URL. Error messages never include the value: it embeds a provider API key. */
+const HTTPS_ONLY = 'RPC_URL must be an https URL (plain http only for localhost or 127.0.0.1)'
+
+/** RPC_URL wins; DEVNET_RPC lets `node --env-file=litesvm-diff/.env` work without exporting anything. */
+function rawRpcUrl(env: NodeJS.ProcessEnv): string | undefined {
+  const pick = (value: string | undefined) => (value === undefined || value.trim() === '' ? undefined : value.trim())
+  return pick(env.RPC_URL) ?? pick(env.DEVNET_RPC)
+}
+
+/** Validates the RPC URL. Error messages never include the value: it embeds a provider API key. */
 function parseRpcUrl(raw: string | undefined): URL {
-  if (raw === undefined || raw.trim() === '') {
-    throw new Error('RPC_URL is required (an http(s) URL; for devnet use DEVNET_RPC from litesvm-diff/.env)')
+  if (raw === undefined) {
+    throw new Error('RPC_URL is required (an https URL; for devnet load DEVNET_RPC from litesvm-diff/.env)')
   }
   let url: URL
   try {
-    url = new URL(raw.trim())
+    url = new URL(raw)
   } catch {
-    throw new Error('RPC_URL must be an http(s) URL')
+    throw new Error(HTTPS_ONLY)
   }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('RPC_URL must be an http(s) URL')
+  const isLocalHttp = url.protocol === 'http:' && LOCAL_HTTP_HOSTS.has(url.hostname)
+  if (url.protocol !== 'https:' && !isLocalHttp) throw new Error(HTTPS_ONLY)
   return url
 }
+
+/** Keeps printable ASCII only, so a crafted file or directory name cannot inject terminal escapes. */
+const printable = (text: string): string => text.replace(/[^\x20-\x7E]/g, '?')
 
 /** Replaces every part of the RPC URL that could identify the endpoint or carry its key. */
 function redact(text: string, url: URL): string {
@@ -89,7 +105,7 @@ function describeError(err: unknown, url: URL): string {
 const wsolAtaOf = (owner: PublicKey): PublicKey =>
   PublicKey.findProgramAddressSync([owner.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), NATIVE_MINT.toBuffer()], ASSOCIATED_TOKEN_PROGRAM_ID)[0]
 
-const walletOf = (source: string, owner: PublicKey): Wallet => ({ source, owner, wsolAta: wsolAtaOf(owner) })
+const walletOf = (source: string, owner: PublicKey): Wallet => ({ source: printable(source), owner, wsolAta: wsolAtaOf(owner) })
 
 function isSecretKeyList(json: unknown): json is number[][] {
   return Array.isArray(json) && json.every((entry) =>
@@ -97,7 +113,10 @@ function isSecretKeyList(json: unknown): json is number[][] {
     entry.every((b) => Number.isInteger(b) && b >= 0 && b <= BYTE_MAX))
 }
 
-/** Derives the public key, then zeroes both copies of the secret so it does not outlive this call. */
+/**
+ * Derives the public key, then overwrites this function's copies of the secret bytes. Best effort only:
+ * the ed25519 library and the JSON text read from disk keep their own copies until garbage collection.
+ */
 function publicKeyOfSecret(secret: number[], file: string, index: number): PublicKey {
   const bytes = Uint8Array.from(secret)
   try {
@@ -130,7 +149,7 @@ function listTradersFiles(dir: string): string[] {
     return readdirSync(dir).filter((name) => name.endsWith(TRADERS_SUFFIX)).sort().map((name) => join(dir, name))
   } catch (err) {
     const code = err instanceof Error && 'code' in err ? String(err.code) : 'read error'
-    console.error(`note: skipping ${dir} (${code})`)
+    console.error(`note: skipping ${printable(dir)} (${printable(code)})`)
     return []
   }
 }
@@ -186,11 +205,11 @@ function renderTable(rows: readonly Row[]): string {
 }
 
 async function main(): Promise<number> {
-  const url = parseRpcUrl(process.env.RPC_URL)
+  const url = parseRpcUrl(rawRpcUrl(process.env))
   const payerPath = process.env.PAYER_KEYPAIR?.trim() || DEFAULT_PAYER_KEYPAIR
   const payer = loadCrankKeypair(payerPath).publicKey
   const scan = scanTraders(tradersDirs(process.env.TRADERS_DIRS))
-  scan.problems.forEach((problem) => console.error(`error: ${problem}`))
+  scan.problems.forEach((problem) => console.error(`error: ${printable(problem)}`))
   const wallets = dedupe([walletOf('payer', payer), ...scan.wallets])
   const connection = new Connection(url.href, 'confirmed')
   let lamports: bigint[]
@@ -209,10 +228,10 @@ main().then(
   (code) => { process.exitCode = code },
   (err: unknown) => {
     const message = err instanceof Error ? err.message : String(err)
-    const rpcUrl = process.env.RPC_URL ?? ''
-    // Last line of defence: the RPC_URL value must never reach the terminal.
-    const safe = rpcUrl.length >= MIN_SECRET_FRAGMENT ? message.split(rpcUrl).join('[redacted]') : message
-    console.error(`devnet-balance: ${safe}`)
+    // Last line of defence: neither RPC URL value may reach the terminal.
+    const secrets = [process.env.RPC_URL, process.env.DEVNET_RPC].filter((v): v is string => (v ?? '').length >= MIN_SECRET_FRAGMENT)
+    const safe = secrets.reduce((acc, secret) => acc.split(secret).join('[redacted]'), message)
+    console.error(`devnet-balance: ${printable(safe)}`)
     process.exitCode = 1
   },
 )
