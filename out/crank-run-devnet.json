@@ -1,0 +1,278 @@
+{
+ "task": "CRK-07",
+ "cluster": "devnet",
+ "routerProgramId": "D4sk6wwELD6cmd7tv6hE4hkxQP8SF8tjdegYym8iWNNb",
+ "dbcProgramId": "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN",
+ "payer": "CamCkeR9iqBij1ZyrEYj9mp6emQtpMVdWWVCUX46tFLE",
+ "traders": [
+  "7vUt3DetCYqSkecCkU634RM9FJimmZgV4X4PEjwRppC1",
+  "7kYNJGf6YnUALRaqyfYv563d71EY8zDgu7g7BXKi8gWx",
+  "EPjcnGTa24a2TWkHRRPqhUTMdSdJL4K1AnZ6R8QRpsMk",
+  "FYiykWeCd6nrEwHfSmp3Vz6XpPwxeV65iPR2gwT72kj1",
+  "Ce3pBSfscriaR4Grq4j2Z6U5sVdTcxaJ73eCz9z7vK63",
+  "gGqNyojKq24wBGt6Lgdk8CEDg2oPw9ZzjCAdo89EahY"
+ ],
+ "migrationQuoteThreshold": "300000000",
+ "feeBps": 100,
+ "buyChunkLamports": "7500000",
+ "graduate": {
+  "startedAt": "2026-10-11T13:48:47.308Z",
+  "payerSolBefore": "12.306499322",
+  "accounts": {
+   "market": "5t7tfUeP2msicPhFihz5vcasYqwk4tKTpgQRui96oyar",
+   "pool": "FjKKTW9qC1MfvChWRL5nqkbLUdFuE3cNbUKG7Tid1Sdd",
+   "config": "B6xM3xMZW7KGmMXnForwo1SVzJoJ963yDLYdRjCdxdF3",
+   "baseMint": "82LQAt9Qcq4YuT1UeuDgA5e5sRWr3tHbHS7xYPv8HUgF",
+   "quoteMint": "So11111111111111111111111111111111111111112",
+   "baseVault": "FyR8hwDHUQaXGVqBkDTrxD6uN9oPagQqxhUJBunZfNYj",
+   "quoteVault": "hZDchE6kR14qgHHZNH2uCnNyAGfdzxhjzX7HgF98DPi",
+   "bufferVault": "9jEek4nrA41ixVqks2H4k1gxcnSqm1GSGj2bUAb9KEDV"
+  },
+  "antiWhaleCap": "159999961978257",
+  "signatures": {
+   "launch": [
+    "5LTdtLJ4R2Thsse8QwoDuwRubX8DSNt1g1DjhEDZQALvozafPYigjWhhShw4BJsUDEcbuVmuug2nPNjwq9LwHEo1",
+    "4zRUs9tU3tXj7UFn4JLRkUERbmVF8sfjivabBhmb8dsQqLwWxJq5vKyPqjp48uDjrJ2o7UJrbkNrLYnFudeAME2e",
+    "5t2pAB5Sc4ZSseP5Ebs427yJL6pY7SRKM5T1K2tdVawaTm4rS9JyLdVdzCypdybAapWrSrixr6VWmu7ejF3TqKCV"
+   ],
+   "buys": [
+    "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"
+   ]
+  },
+  "graduated": true,
+  "finalized": false,
+  "migrationProgress": 2,
+  "quoteReserve": "300000001",
+  "positions": 6,
+  "largestPosition": "133608770292724",
+  "finishedAt": "2026-10-11T13:50:54.459Z",
+  "payerSolAfter": "11.942038122",
+  "spentSol": "0.364461200"
+ },
+ "crank": {
+  "log": "out/crank-run.log",
+  "command": "RPC_URL=\"$DEVNET_RPC\" CLUSTER=devnet CRANK_INTERVAL_MS=10000 npm start (stopped after 180 s)",
+  "guards": "worker defaults (MIN_ATA_VALUE_LAMPORTS 250000000): every trader kept its wSOL ATA from buying, so no claim needed an ATA",
+  "startedAt": "2026-10-11T13:51:28.833Z",
+  "finishedAt": "2026-10-11T13:54:31.913Z",
+  "ticks": 10,
+  "jobErrors": {
+   "finalize": 0,
+   "migrate": 0,
+   "claims": 0,
+   "auto-exit": 0
+  },
+  "ourMarket": {
+   "market": "5t7tfUeP2msicPhFihz5vcasYqwk4tKTpgQRui96oyar",
+   "finalize": [
+    "47SpY5gxp1FJvpaf45hxcLYy6jJ9J1GHP2x1gEzxLMo39S1SS8gUy5XkP4kfdjSM57HbVu4L5hsHmW51ssdNY5db"
+   ],
+   "migrate": [
+    "66DsPHyTrbAqsGASxypuPxJYNtRswTePnSqHtvYqr4XtRt28SBQJwpMWgGYSyJMTGXuEVUnEP3bmGLzBxqYtdN2r"
+   ],
+   "claims": [
+    "2J5UjedqBwaYaAVgARUaQqvd8wBpbLxKkzmB61aLYgyn3uFmjxTDaK4EoBxVFhMEBBFAGWM5XsvPtaX9hze3PcKQ",
+    "H3TxWsaTF5ouTmmKkQJKt8Kbj7tX7tHzbiqfANaPbrDBAFfQUP4VL5x21kETD3LEjmdsW3aei6wnrDeHscLthbf",
+    "bDEnCVfFqvjE7rAffPFU6Y5strw7HTKiuamMLY54mG3woFeLY34qkMwC79uegim8PLKXCbfHrD2gYHeQZycsESG",
+    "481FyWuHirpMU9fLpyM3tkENXu8QGFzgZvmUrQg1pRrTrYzaS6fgrpfUVXp7ZCW4MCDNQJZAj9tU9YtDEFZbjv9F",
+    "63Um29HwvSeRT4LbcZTtHJrPjJ46LnZ3Pn5DMJdW1SYoMkh3fLriNmB2s11YMMUejxNC2C75VJXTVbTqFJrDRUSy",
+    "3XoLQ7eqr48EsMv1jzWPr84SX7Cs5sbzRLapkceAsYao9qxRsDvSXdVbNKzWRURsqGTJsdg1vFVZqX261HazuHsV"
+   ],
+   "auto-exit": []
+  },
+  "otherMarkets": [
+   "3CuTfvMa31CrVBTLSikzuEPj2eqf74aRC3FQo4JXb6sK",
+   "9DveBfq3oS9BnUsPjHC1Qa7RgFJhuKRXGx9mK8bpvU9L",
+   "AvWgP49kRfr92pd3FmMJ9yG7zFBtrhVyRwfNPfFQUgr4"
+  ],
+  "jobs": {
+   "finalize": [
+    {
+     "signature": "47SpY5gxp1FJvpaf45hxcLYy6jJ9J1GHP2x1gEzxLMo39S1SS8gUy5XkP4kfdjSM57HbVu4L5hsHmW51ssdNY5db",
+     "tick": 1,
+     "status": "finalized",
+     "err": null,
+     "markets": [
+      "5t7tfUeP2msicPhFihz5vcasYqwk4tKTpgQRui96oyar"
+     ]
+    }
+   ],
+   "migrate": [
+    {
+     "signature": "634urULHnhgFi9N1G7FESQbKenhZCX1jDxteSYQ4ZpR19pdUz2Cik9DGLSu6qtgFDCW51UjfHdDB6GQWKXWuZRWt",
+     "tick": 1,
+     "status": "finalized",
+     "err": null,
+     "markets": [
+      "3CuTfvMa31CrVBTLSikzuEPj2eqf74aRC3FQo4JXb6sK"
+     ]
+    },
+    {
+     "signature": "66DsPHyTrbAqsGASxypuPxJYNtRswTePnSqHtvYqr4XtRt28SBQJwpMWgGYSyJMTGXuEVUnEP3bmGLzBxqYtdN2r",
+     "tick": 1,
+     "status": "finalized",
+     "err": null,
+     "markets": [
+      "5t7tfUeP2msicPhFihz5vcasYqwk4tKTpgQRui96oyar"
+     ]
+    },
+    {
+     "signature": "55oeWZgbWWVonzaLuB8TVU4v85tF2cm55XGbMNoa5ndBYGtty8zBgJYeg2bFeH5o9erD2Xt4vgh2gKbaMhC97JnW",
+     "tick": 1,
+     "status": "finalized",
+     "err": null,
+     "markets": [
+      "9DveBfq3oS9BnUsPjHC1Qa7RgFJhuKRXGx9mK8bpvU9L"
+     ]
+    },
+    {
+     "signature": "5RixAXkSUGXTmmbZg41W9cion1JZXXruC87RQ4gZCRpGHn91gLGEdYi3FWW5sSve5PorfBDP4JNRBuPTKfJ31i5b",
+     "tick": 1,
+     "status": "finalized",
+     "err": null,
+     "markets": [
+      "AvWgP49kRfr92pd3FmMJ9yG7zFBtrhVyRwfNPfFQUgr4"
+     ]
+    }
+   ],
+   "claims": [
+    {
+     "signature": "2J5UjedqBwaYaAVgARUaQqvd8wBpbLxKkzmB61aLYgyn3uFmjxTDaK4EoBxVFhMEBBFAGWM5XsvPtaX9hze3PcKQ",
+     "tick": 1,
+     "status": "finalized",
+     "err": null,
+     "markets": [
+      "5t7tfUeP2msicPhFihz5vcasYqwk4tKTpgQRui96oyar"
+     ]
+    },
+    {
+     "signature": "H3TxWsaTF5ouTmmKkQJKt8Kbj7tX7tHzbiqfANaPbrDBAFfQUP4VL5x21kETD3LEjmdsW3aei6wnrDeHscLthbf",
+     "tick": 1,
+     "status": "finalized",
+     "err": null,
+     "markets": [
+      "5t7tfUeP2msicPhFihz5vcasYqwk4tKTpgQRui96oyar"
+     ]
+    },
+    {
+     "signature": "bDEnCVfFqvjE7rAffPFU6Y5strw7HTKiuamMLY54mG3woFeLY34qkMwC79uegim8PLKXCbfHrD2gYHeQZycsESG",
+     "tick": 1,
+     "status": "finalized",
+     "err": null,
+     "markets": [
+      "5t7tfUeP2msicPhFihz5vcasYqwk4tKTpgQRui96oyar"
+     ]
+    },
+    {
+     "signature": "481FyWuHirpMU9fLpyM3tkENXu8QGFzgZvmUrQg1pRrTrYzaS6fgrpfUVXp7ZCW4MCDNQJZAj9tU9YtDEFZbjv9F",
+     "tick": 1,
+     "status": "finalized",
+     "err": null,
+     "markets": [
+      "5t7tfUeP2msicPhFihz5vcasYqwk4tKTpgQRui96oyar"
+     ]
+    },
+    {
+     "signature": "63Um29HwvSeRT4LbcZTtHJrPjJ46LnZ3Pn5DMJdW1SYoMkh3fLriNmB2s11YMMUejxNC2C75VJXTVbTqFJrDRUSy",
+     "tick": 1,
+     "status": "finalized",
+     "err": null,
+     "markets": [
+      "5t7tfUeP2msicPhFihz5vcasYqwk4tKTpgQRui96oyar"
+     ]
+    },
+    {
+     "signature": "3XoLQ7eqr48EsMv1jzWPr84SX7Cs5sbzRLapkceAsYao9qxRsDvSXdVbNKzWRURsqGTJsdg1vFVZqX261HazuHsV",
+     "tick": 2,
+     "status": "finalized",
+     "err": null,
+     "markets": [
+      "5t7tfUeP2msicPhFihz5vcasYqwk4tKTpgQRui96oyar"
+     ]
+    }
+   ],
+   "auto-exit": []
+  }
+ },
+ "sweep": {
+  "at": "2026-10-11T13:56:20.770Z",
+  "positionsLeft": 0,
+  "traderPositionsLeft": 0,
+  "sweptSol": "0.032258335",
+  "leftoverLamports": "0",
+  "failed": 0,
+  "rows": [
+   {
+    "trader": "7vUt3DetCYqSkecCkU634RM9FJimmZgV4X4PEjwRppC1",
+    "lamports": "4631440",
+    "signature": "2aABKakgEkvRMDZpVfqWtPgmhJpeMUE2LK3XojaSFrFkL8cpidURNS56pJYXfZibhTN6cS63KWQ1KfEggphGseXA"
+   },
+   {
+    "trader": "7kYNJGf6YnUALRaqyfYv563d71EY8zDgu7g7BXKi8gWx",
+    "lamports": "9101135",
+    "signature": "3RzpYHtg9LprrUwHrQnqUTU8Kq5VAq2BZYKHLa8rAzFfNqSiYB9gb6PhdhYz6rH1acB2qED4umcbobHHLTRiPrcu"
+   },
+   {
+    "trader": "EPjcnGTa24a2TWkHRRPqhUTMdSdJL4K1AnZ6R8QRpsMk",
+    "lamports": "4631440",
+    "signature": "4Qoz7bQwsHAwDXXgLUvsjpU5JmgCc6YZmRMV1pMBBDbLAb9saDm8nQu3gk5YYXuPZbVkWDn9ABFGu4RVTcWeK7n3"
+   },
+   {
+    "trader": "FYiykWeCd6nrEwHfSmp3Vz6XpPwxeV65iPR2gwT72kj1",
+    "lamports": "4631440",
+    "signature": "mYM6xNSFJVuxuWGTnrAuNxz7gmHhbB9JZncGxBqxvmTyUP8qEQi9yLv2HqoQibfRAGq9SNp1TN4JUwNDd6ucMZc"
+   },
+   {
+    "trader": "Ce3pBSfscriaR4Grq4j2Z6U5sVdTcxaJ73eCz9z7vK63",
+    "lamports": "4631440",
+    "signature": "Yasd4sgFKpJ1VtbroUZELLLeunA4h39vHZcPwjwV2aR36sgsaiGb2mcp3Hu4fHyzudNXtLEPS4h8B9yyvxKJKK2"
+   },
+   {
+    "trader": "gGqNyojKq24wBGt6Lgdk8CEDg2oPw9ZzjCAdo89EahY",
+    "lamports": "4631440",
+    "signature": "Y1hdztDSqsArdTNepJJfJZbTd9qc3wc5PuHb5xQ444ih9oRvzHisCuRYmU5rX6DT3tCuLZfsAKj4R41cqvc6r7o"
+   }
+  ],
+  "payerSolAfter": "11.908020177"
+ }
+}
