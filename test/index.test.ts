@@ -1,6 +1,10 @@
 /**
- * CRK-07: the worker entrypoint registers every crank job, in tick order, with the guards of its env config.
+ * CRK-07: the worker entrypoint registers every crank job, in tick order, with the guards of its env config; it never
+ * exits as a silent no-op when started; and it scrubs every part of the RPC URL that could carry the API key.
  */
+import { execFile } from 'node:child_process'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Keypair, type Connection } from '@solana/web3.js'
 import { getClusterConfig } from '@trucee/sdk'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -10,8 +14,8 @@ import { createAutoExitJob } from '../src/crank/jobs/auto-exit.js'
 import { createClaimsJob } from '../src/crank/jobs/claims.js'
 import { finalizeJob } from '../src/crank/jobs/finalize.js'
 import { createMigrateJob } from '../src/crank/jobs/migrate.js'
-import type { Logger } from '../src/log.js'
-import { buildJobs } from '../src/index.js'
+import { log, type Logger } from '../src/log.js'
+import { buildJobs, protectRpcUrl, shouldStartWorker } from '../src/index.js'
 
 vi.mock('../src/crank/jobs/claims.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/crank/jobs/claims.js')>()
@@ -124,5 +128,130 @@ describe('buildJobs', () => {
 
       expect(getProgramAccounts, job.name).toHaveBeenCalled()
     }
+  })
+})
+
+const WORKER_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const INDEX_PATH = join(WORKER_DIR, 'src', 'index.ts')
+const SPAWN_TIMEOUT_MS = 20_000
+
+interface ChildRun {
+  readonly code: number | null
+  readonly output: string
+}
+
+/** Runs node in worker/ with `args` and an env without any worker config but `extra`; resolves on exit. */
+function runNode(args: readonly string[], extra: Readonly<Record<string, string>>): Promise<ChildRun> {
+  const { RPC_URL: _rpc, DEVNET_RPC: _devnet, CLUSTER: _cluster, CRANK_FORCE_START: _force, ...inherited } = process.env
+  return new Promise((done) => {
+    execFile(process.execPath, [...args], { cwd: WORKER_DIR, env: { ...inherited, ...extra }, timeout: SPAWN_TIMEOUT_MS }, (err, stdout, stderr) => {
+      const code = err === null ? 0 : typeof err.code === 'number' ? err.code : null
+      done({ code, output: `${stdout}${stderr}` })
+    })
+  })
+}
+
+/** Imports src/index.ts from `node -e`, where process.argv[1] is undefined, as another runner would load it. */
+const IMPORT_INDEX = ['--import', 'tsx', '--input-type=module', '-e', "await import('./src/index.ts')"]
+
+describe('worker start', () => {
+  it('npm start and the Docker CMD (node --import tsx src/index.ts) run main(): an invalid config exits non-zero with the config error', async () => {
+    const run = await runNode(['--import', 'tsx', 'src/index.ts'], { CLUSTER: 'bogus' })
+
+    expect(run.code).not.toBe(0)
+    expect(run.output).toContain('worker failed to start')
+    expect(run.output).toContain('Invalid worker config')
+    expect(run.output).toContain('CLUSTER must be one of')
+  }, SPAWN_TIMEOUT_MS)
+
+  it('an import with CRANK_FORCE_START=1 runs main()', async () => {
+    const run = await runNode(IMPORT_INDEX, { CLUSTER: 'bogus', CRANK_FORCE_START: '1' })
+
+    expect(run.code).not.toBe(0)
+    expect(run.output).toContain('Invalid worker config')
+  }, SPAWN_TIMEOUT_MS)
+
+  it('an import without CRANK_FORCE_START starts nothing', async () => {
+    const run = await runNode(IMPORT_INDEX, { CLUSTER: 'bogus' })
+
+    expect(run).toEqual({ code: 0, output: '' })
+  }, SPAWN_TIMEOUT_MS)
+})
+
+/** Captures logger output (stdout) while `fn` runs. */
+function captureStdout(fn: () => void): string {
+  const chunks: string[] = []
+  const spy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk: string | Uint8Array) => {
+    chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'))
+    return true
+  })
+  try {
+    fn()
+  } finally {
+    spy.mockRestore()
+  }
+  return chunks.join('')
+}
+
+describe('shouldStartWorker', () => {
+  const missingScript = join(WORKER_DIR, 'no-such-dir', 'start-script.ts')
+
+  it('starts when the start script is this module, silently', () => {
+    let started = false
+    const output = captureStdout(() => {
+      started = shouldStartWorker(INDEX_PATH, {}, INDEX_PATH)
+    })
+
+    expect(started).toBe(true)
+    expect(output).toBe('')
+  })
+
+  it('does not start when imported (another start script, or none), silently', () => {
+    let started: boolean[] = []
+    const output = captureStdout(() => {
+      started = [shouldStartWorker(join(WORKER_DIR, 'package.json'), {}, INDEX_PATH), shouldStartWorker(undefined, {}, INDEX_PATH)]
+    })
+
+    expect(started).toEqual([false, false])
+    expect(output).toBe('')
+  })
+
+  it('starts when imported with CRANK_FORCE_START=1', () => {
+    expect(shouldStartWorker(undefined, { CRANK_FORCE_START: '1' }, INDEX_PATH)).toBe(true)
+    expect(shouldStartWorker(join(WORKER_DIR, 'package.json'), { CRANK_FORCE_START: '1' }, INDEX_PATH)).toBe(true)
+  })
+
+  it('logs one warning without the path when the start script cannot be resolved, and starts only when forced', () => {
+    let started: boolean[] = []
+    const output = captureStdout(() => {
+      started = [shouldStartWorker(missingScript, {}, INDEX_PATH), shouldStartWorker(missingScript, { CRANK_FORCE_START: '1' }, INDEX_PATH)]
+    })
+    const lines = output.trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>)
+
+    expect(started).toEqual([false, true])
+    expect(lines.map((line) => [line.level, line.forced])).toEqual([['warn', false], ['warn', true]])
+    expect(lines[0]?.msg).toContain('CRANK_FORCE_START=1')
+    expect(output).not.toContain('no-such-dir')
+    expect(output).not.toContain(WORKER_DIR)
+  })
+})
+
+describe('protectRpcUrl', () => {
+  const PATH_KEY = 'abcdefgh12345678'
+  const QUERY_KEY = 'zzzzzzzz9999'
+
+  it('scrubs the bare API key from the path and from the query wherever it appears in a log line', () => {
+    protectRpcUrl(`https://rpc.example.com/v2/${PATH_KEY}?api-key=${QUERY_KEY}`)
+
+    const output = captureStdout(() => {
+      log.warn(`invalid api-key ${QUERY_KEY}`)
+      log.error('rpc rejected the request', { error: `unknown key ${PATH_KEY}`, keys: [QUERY_KEY, PATH_KEY] })
+      log.info('provider', { host: 'rpc.example.com' })
+    })
+
+    expect(output).not.toContain(QUERY_KEY)
+    expect(output).not.toContain(PATH_KEY)
+    expect(output).not.toContain('rpc.example.com')
+    expect(output).toContain('invalid api-key [redacted]')
   })
 })

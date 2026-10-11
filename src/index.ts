@@ -1,7 +1,8 @@
 /**
  * Worker entrypoint: validates config and the crank keypair, starts the crank loop with every job (CRK-07), stops it
  * on SIGINT/SIGTERM. Each tick runs finalize, migrate, claims and auto-exit in that order, so a graduated market can be
- * finalized, migrated and claimed in one tick (within MAX_TX_PER_TICK). Importing this module (tests) starts nothing.
+ * finalized, migrated and claimed in one tick (within MAX_TX_PER_TICK). Importing this module (tests) starts nothing
+ * unless CRANK_FORCE_START=1.
  */
 import { existsSync, realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -25,6 +26,8 @@ const SIGNAL_ECHO_WINDOW_MS = 1_000
 const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM'] as const
 const EXIT_OK = 0
 const EXIT_FAILURE = 1
+/** Set to "1" to start the worker when this module is not node's start script (e.g. loaded by another runner). */
+const FORCE_START_ENV = 'CRANK_FORCE_START'
 
 /**
  * The crank jobs in tick order, each spending within the guards of `cfg` (MIN_ATA_VALUE_LAMPORTS,
@@ -40,13 +43,15 @@ function loadEnvFile(): void {
 }
 
 /**
- * Registers the RPC URL, its host, path and query as log secrets. The host names the provider, and the logger reduces
- * any URL in an RPC error to its host, so the host is scrubbed too and never logged.
+ * Registers the RPC URL and every part of it that could name the provider or carry its API key as log secrets: origin,
+ * host, path and query, each path segment and each query value. An RPC error can quote the bare key without the URL
+ * around it, and the logger reduces any URL in an error to its host, so the host is scrubbed too and never logged.
  */
-function protectRpcUrl(rpcUrl: string): void {
+export function protectRpcUrl(rpcUrl: string): void {
   const url = new URL(rpcUrl)
-  // registerSecret ignores values under 8 chars, so a bare "/" path or an empty query is skipped.
-  for (const secret of [rpcUrl, url.href, url.host, url.hostname, url.pathname, url.search]) registerSecret(secret)
+  const parts = [rpcUrl, url.href, url.origin, url.host, url.hostname, url.pathname, url.search]
+  // registerSecret ignores values under 8 chars, so "/", "v2" or an empty query never become secrets.
+  for (const secret of [...parts, ...url.pathname.split('/'), ...url.searchParams.values()]) registerSecret(secret)
 }
 
 function exitOnFatal(kind: 'uncaughtException' | 'unhandledRejection'): (err: unknown) => void {
@@ -108,18 +113,36 @@ async function main(): Promise<void> {
   installShutdown(crank)
 }
 
-/** True when this file is the script node was started with (npm start), false when it is imported. */
-function isEntrypoint(): boolean {
-  const script = process.argv[1]
-  if (script === undefined) return false
+/** How this module was loaded: as node's start script, imported (tests, `node -e`), or from an unresolvable script. */
+type LoadedAs = 'entrypoint' | 'imported' | 'unresolved'
+
+function loadedAs(script: string | undefined, self: string): LoadedAs {
+  if (script === undefined) return 'imported'
   try {
-    return realpathSync(script) === realpathSync(fileURLToPath(import.meta.url))
+    return realpathSync(script) === realpathSync(self) ? 'entrypoint' : 'imported'
   } catch {
-    return false
+    return 'unresolved'
   }
 }
 
-if (isEntrypoint()) {
+/**
+ * Whether the worker starts: when this file is node's start script (npm start, the Docker CMD), or when
+ * CRANK_FORCE_START=1 is set in the process env (read before worker/.env is loaded). A start script whose path cannot
+ * be resolved logs one warning (no path: it may sit under a secret directory) instead of passing as a silent no-op.
+ *
+ * @param script process.argv[1], the script node was started with
+ * @param self this module's file path
+ */
+export function shouldStartWorker(script: string | undefined, env: NodeJS.ProcessEnv, self: string): boolean {
+  const as = loadedAs(script, self)
+  const forced = env[FORCE_START_ENV] === '1'
+  if (as === 'unresolved') {
+    log.warn(`cannot resolve the start script; the worker starts only with ${FORCE_START_ENV}=1`, { forced })
+  }
+  return as === 'entrypoint' || forced
+}
+
+if (shouldStartWorker(process.argv[1], process.env, fileURLToPath(import.meta.url))) {
   process.on('uncaughtException', exitOnFatal('uncaughtException'))
   process.on('unhandledRejection', exitOnFatal('unhandledRejection'))
 
