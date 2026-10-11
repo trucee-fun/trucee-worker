@@ -1,6 +1,7 @@
 /**
  * CRK-05: the auto-exit crank job. planAutoExits is tested with synthetic decoded accounts; autoExitJob.run with an
- * in-memory Connection fake that serves raw account bytes (Position, Market, DBC pool, Clock sysvar).
+ * in-memory Connection fake that serves raw account bytes (Position, Market, DBC pool, Clock sysvar); timeouts run on
+ * fake timers.
  */
 import { Buffer } from 'node:buffer'
 import {
@@ -8,10 +9,11 @@ import {
   PublicKey,
   SYSVAR_CLOCK_PUBKEY,
   SystemProgram,
+  TransactionMessage,
+  VersionedTransaction,
   type Connection,
   type TransactionError,
   type TransactionInstruction,
-  type VersionedTransaction,
 } from '@solana/web3.js'
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -36,8 +38,14 @@ import {
   type QuoteMintInfo,
 } from '@trucee/sdk'
 import { describe, expect, it, vi } from 'vitest'
-import type { CrankContext } from '../src/crank/index.js'
-import { autoExitJob, planAutoExits } from '../src/crank/jobs/auto-exit.js'
+import type { CrankContext, CrankJobResult } from '../src/crank/index.js'
+import {
+  CONFIRM_TIMEOUT_MS,
+  MAX_ATTEMPTS_PER_TX,
+  RPC_TIMEOUT_MS,
+  autoExitJob,
+  planAutoExits,
+} from '../src/crank/jobs/auto-exit.js'
 
 const cluster = getClusterConfig('localnet')
 const NOW = 1_800_000_000n
@@ -276,10 +284,10 @@ const POOL_SIZE = 416
 const POOL_PROGRESS_OFFSET = 308
 const CLOCK_SIZE = 40
 const CLOCK_UNIX_TIMESTAMP_OFFSET = 32
+const INVALID_EXIT_AMOUNT = 6007
 const AUTO_EXIT_NOT_DUE = 6020
 const AUTO_EXIT_CURVE_COMPLETE = 6021
 const BUFFER_INSUFFICIENT = 6015
-const CONFIRM_TIMEOUT_MS = 45_000
 const RPC_KEY = 'FAKEKEY0123456789abcdef'
 const RPC_ERROR = `failed to get info: request to https://rpc.example.invalid/v2/${RPC_KEY}?api-key=${RPC_KEY} failed, reason: ECONNRESET`
 /** Far past the wall clock, so only a job that reads the chain clock sees these deadlines as due. */
@@ -334,48 +342,66 @@ interface RawAccount {
 interface Chain {
   readonly positions: readonly { address: PublicKey; data: Buffer }[]
   readonly accounts: ReadonlyMap<string, RawAccount>
-  readonly clockUnix: bigint
+  /** The Clock sysvar's data; null when the account is missing. */
+  readonly clock: Buffer | null
   readonly simulate?: (tx: VersionedTransaction, index: number) => SimulationValue
   readonly confirmErr?: TransactionError | null
 }
 
 const accountInfo = (data: Buffer, owner: PublicKey = ROUTER_PROGRAM_ID) => ({ data, owner, lamports: 1_000_000, executable: false, rentEpoch: 0 })
+/** A request that never answers, for the timeout tests. */
+const hang = <T>(): Promise<T> => new Promise<T>(() => undefined)
 
 function fakeConnection(chain: Chain) {
   const simulated: VersionedTransaction[] = []
   const sent: VersionedTransaction[] = []
+  const blockhashes: string[] = []
   const fake = {
-    getProgramAccounts: vi.fn(async (_programId: PublicKey) =>
+    getProgramAccounts: vi.fn(async (_programId: PublicKey, _config?: unknown) =>
       chain.positions.map(({ address, data }) => ({ pubkey: address, account: accountInfo(data) })),
     ),
-    getAccountInfo: vi.fn(async (key: PublicKey) => (key.equals(SYSVAR_CLOCK_PUBKEY) ? accountInfo(encodeClock(chain.clockUnix)) : null)),
-    getMultipleAccountsInfo: vi.fn(async (keys: PublicKey[]) =>
+    getAccountInfo: vi.fn(async (key: PublicKey, _commitment?: unknown) =>
+      key.equals(SYSVAR_CLOCK_PUBKEY) && chain.clock !== null ? accountInfo(chain.clock) : null,
+    ),
+    getMultipleAccountsInfo: vi.fn(async (keys: PublicKey[], _commitment?: unknown) =>
       keys.map((key) => {
         const account = chain.accounts.get(key.toBase58())
         return account === undefined ? null : accountInfo(account.data, account.owner)
       }),
     ),
-    getLatestBlockhash: vi.fn(async () => ({ blockhash: randomKey().toBase58(), lastValidBlockHeight: 1_000 })),
-    simulateTransaction: vi.fn(async (tx: VersionedTransaction) => {
+    getLatestBlockhash: vi.fn(async (_commitment?: unknown) => {
+      blockhashes.push(randomKey().toBase58())
+      return { blockhash: blockhashes[blockhashes.length - 1] ?? '', lastValidBlockHeight: 1_000 }
+    }),
+    simulateTransaction: vi.fn(async (tx: VersionedTransaction, _config?: unknown) => {
       simulated.push(tx)
       const value = chain.simulate?.(tx, simulated.length - 1) ?? { err: null, logs: [] }
       return { context: { slot: 1 }, value }
     }),
-    sendTransaction: vi.fn(async (tx: VersionedTransaction) => {
-      sent.push(tx)
+    sendRawTransaction: vi.fn(async (raw: Uint8Array, _options?: unknown) => {
+      sent.push(VersionedTransaction.deserialize(raw))
       return `sig-${sent.length}`
     }),
-    confirmTransaction: vi.fn(async () => ({ context: { slot: 2 }, value: { err: chain.confirmErr ?? null } })),
+    confirmTransaction: vi.fn(async (_strategy: unknown, _commitment?: unknown) => ({
+      context: { slot: 2 },
+      value: { err: chain.confirmErr ?? null },
+    })),
   }
-  return { connection: fake as unknown as Connection, fake, simulated, sent }
+  return { connection: fake as unknown as Connection, fake, simulated, sent, blockhashes }
 }
+
+const failedLine = (program: PublicKey, code: number): string =>
+  `Program ${program.toBase58()} failed: custom program error: 0x${code.toString(16)}`
 
 function routerFailure(code: number): SimulationValue {
   const router = ROUTER_PROGRAM_ID.toBase58()
-  return {
-    err: { InstructionError: [1, { Custom: code }] },
-    logs: [`Program ${router} invoke [1]`, `Program ${router} failed: custom program error: 0x${code.toString(16)}`],
-  }
+  return { err: { InstructionError: [1, { Custom: code }] }, logs: [`Program ${router} invoke [1]`, failedLine(ROUTER_PROGRAM_ID, code)] }
+}
+
+/** The same code, but raised by the DBC swap CPI: the innermost failure is logged first. */
+function dbcFailure(code: number): SimulationValue {
+  const logs = [`Program ${ROUTER_PROGRAM_ID.toBase58()} invoke [1]`, `Program ${DBC_PROGRAM_ID.toBase58()} invoke [2]`, failedLine(DBC_PROGRAM_ID, code), failedLine(ROUTER_PROGRAM_ID, code)]
+  return { err: { InstructionError: [1, { Custom: code }] }, logs }
 }
 
 const fakeLog = () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() })
@@ -399,7 +425,7 @@ function chainOf(entries: readonly ChainEntry[], overrides: Partial<Chain> = {})
   return {
     positions: entries.map(({ position }) => ({ address: position.address, data: encodePosition(position) })),
     accounts,
-    clockUnix: CHAIN_NOW,
+    clock: encodeClock(CHAIN_NOW),
     ...overrides,
   }
 }
@@ -407,6 +433,35 @@ function chainOf(entries: readonly ChainEntry[], overrides: Partial<Chain> = {})
 const dueEntry = (deadline: bigint = CHAIN_NOW - 5n, quote: QuoteMintInfo = SOL): ChainEntry => {
   const market = makeMarket(quote)
   return { market, position: makePosition(market, { autoExitDeadline: deadline }) }
+}
+
+const dueEntries = (count: number): ChainEntry[] => Array.from({ length: count }, (_, i) => dueEntry(CHAIN_NOW - 100n + BigInt(i)))
+
+const signatureOf = (tx: VersionedTransaction | undefined): string => Buffer.from(tx?.signatures[0] ?? []).toString('hex')
+
+interface TimedRun {
+  readonly result: CrankJobResult
+  /** Whether the run had settled 1 ms before `ms`. */
+  readonly settledEarly: boolean
+  readonly timersLeft: number
+}
+
+/** Runs the job on fake timers and advances them to just before, then exactly to, `ms`. */
+async function runOnFakeTimers(ms: number, start: () => Promise<CrankJobResult>): Promise<TimedRun> {
+  vi.useFakeTimers()
+  try {
+    let settled = false
+    const pending = start().finally(() => {
+      settled = true
+    })
+    await vi.advanceTimersByTimeAsync(ms - 1)
+    const settledEarly = settled
+    await vi.advanceTimersByTimeAsync(1)
+    const result = await pending
+    return { result, settledEarly, timersLeft: vi.getTimerCount() }
+  } finally {
+    vi.useRealTimers()
+  }
 }
 
 describe('autoExitJob', () => {
@@ -423,8 +478,7 @@ describe('autoExitJob', () => {
 
   it('fetches Position accounts by discriminator, then simulates and sends one signed auto-exit transaction', async () => {
     const payer = Keypair.generate()
-    const entry = dueEntry()
-    const chain = fakeConnection(chainOf([entry]))
+    const chain = fakeConnection(chainOf([dueEntry()]))
 
     const result = await autoExitJob.run(context(chain.connection, payer))
 
@@ -435,12 +489,28 @@ describe('autoExitJob', () => {
       { memcmp: { offset: 0, bytes: Buffer.from(POSITION_DISCRIMINATOR).toString('base64'), encoding: 'base64' } },
     ])
     const tx = chain.sent[0]
-    expect(chain.simulated[0]).toBe(tx)
+    expect(signatureOf(tx)).toBe(signatureOf(chain.simulated[0])) // exactly the simulated transaction
     expect(tx?.message.staticAccountKeys[0]?.equals(payer.publicKey)).toBe(true) // the crank pays
     expect(tx?.signatures[0]?.some((byte) => byte !== 0)).toBe(true) // and signs
     const programs = tx?.message.compiledInstructions.map((ix) => tx.message.staticAccountKeys[ix.programIdIndex]?.toBase58())
     expect(programs).toEqual([ASSOCIATED_TOKEN_PROGRAM_ID.toBase58(), ROUTER_PROGRAM_ID.toBase58()])
+    expect(chain.fake.sendRawTransaction).toHaveBeenCalledWith(expect.any(Uint8Array), { skipPreflight: true })
     expect(chain.fake.confirmTransaction).toHaveBeenCalledTimes(1)
+  })
+
+  it("sends the idempotent create of a missing owner quote ATA, paid by the crank, before auto_exit", async () => {
+    const payer = Keypair.generate()
+    const entry = dueEntry(CHAIN_NOW - 5n, TSLAX)
+    const owner = entry.position.owner // fresh owner: the fake chain has no ATA for it
+    const ownerQuote = getAssociatedTokenAddressSync(TSLAX.mint, owner, false, TOKEN_2022_PROGRAM_ID)
+    const chain = fakeConnection(chainOf([entry]))
+
+    await autoExitJob.run(context(chain.connection, payer))
+
+    const [createAta, exit] = TransactionMessage.decompile(chain.sent[0]!.message).instructions
+    const expected = createAssociatedTokenAccountIdempotentInstruction(payer.publicKey, ownerQuote, owner, TSLAX.mint, TOKEN_2022_PROGRAM_ID)
+    expect(normalize(createAta!)).toEqual(normalize(expected))
+    expect(exit?.keys[4]?.pubkey.equals(ownerQuote)).toBe(true)
   })
 
   it('reads now from the chain Clock sysvar, not the wall clock', async () => {
@@ -453,12 +523,23 @@ describe('autoExitJob', () => {
     expect(before).toEqual({ sent: [], skipped: 0, errors: [] })
     expect(notYetOnChain.fake.simulateTransaction).not.toHaveBeenCalled()
     expect(after.sent).toHaveLength(1)
-    expect(dueOnChain.fake.getAccountInfo).toHaveBeenCalledWith(SYSVAR_CLOCK_PUBKEY)
+    expect(dueOnChain.fake.getAccountInfo.mock.calls[0]?.[0]).toBe(SYSVAR_CLOCK_PUBKEY)
+  })
+
+  it.each([
+    ['missing', null],
+    ['too short', Buffer.alloc(CLOCK_SIZE - 1)],
+  ])('reports a %s Clock sysvar as an error and sends nothing', async (_, clock) => {
+    const chain = fakeConnection(chainOf([dueEntry()], { clock }))
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
+
+    expect(result).toEqual({ sent: [], skipped: 0, errors: [expect.stringContaining('Clock sysvar')] })
+    expect(chain.fake.simulateTransaction).not.toHaveBeenCalled()
   })
 
   it('does not simulate a due position on a complete curve', async () => {
-    const entry = { ...dueEntry(), progress: 2 }
-    const chain = fakeConnection(chainOf([entry]))
+    const chain = fakeConnection(chainOf([{ ...dueEntry(), progress: 2 }]))
 
     const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
 
@@ -467,18 +548,31 @@ describe('autoExitJob', () => {
   })
 
   it.each([
+    ['InvalidExitAmount', INVALID_EXIT_AMOUNT],
     ['AutoExitNotDue', AUTO_EXIT_NOT_DUE],
     ['AutoExitCurveComplete', AUTO_EXIT_CURVE_COMPLETE],
-  ])('counts a %s simulation failure as skipped (info), not an error', async (name, code) => {
+  ])('counts a router %s simulation failure as skipped (info), not an error', async (name, code) => {
     const log = fakeLog()
     const chain = fakeConnection(chainOf([dueEntry()], { simulate: () => routerFailure(code) }))
 
     const result = await autoExitJob.run(context(chain.connection, Keypair.generate(), 10, log))
 
     expect(result).toEqual({ sent: [], skipped: 1, errors: [] })
-    expect(chain.fake.sendTransaction).not.toHaveBeenCalled()
+    expect(chain.fake.sendRawTransaction).not.toHaveBeenCalled()
     expect(log.info).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ reason: name }))
     expect(log.warn).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['raised by the DBC CPI', dbcFailure(AUTO_EXIT_NOT_DUE)],
+    ['with no logs to attribute it', { err: { InstructionError: [1, { Custom: AUTO_EXIT_NOT_DUE }] }, logs: [] }],
+  ])('treats a race code %s as an error, not a race', async (_, failure) => {
+    const chain = fakeConnection(chainOf([dueEntry()], { simulate: () => failure }))
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
+
+    expect(result.skipped).toBe(0)
+    expect(result.errors).toEqual([expect.stringContaining('simulation failed')])
   })
 
   it('records any other simulation failure as an error, skips that position and goes on with the next', async () => {
@@ -506,6 +600,52 @@ describe('autoExitJob', () => {
     expect(chain.sent).toHaveLength(1)
   })
 
+  it('simulates at most ctx.maxTx * 3 exits per tick and counts the rest as skipped', async () => {
+    const maxTx = 2
+    const chain = fakeConnection(chainOf(dueEntries(10), { simulate: () => routerFailure(BUFFER_INSUFFICIENT) }))
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate(), maxTx))
+
+    expect(MAX_ATTEMPTS_PER_TX).toBe(3)
+    expect(chain.fake.simulateTransaction).toHaveBeenCalledTimes(maxTx * MAX_ATTEMPTS_PER_TX)
+    expect(result.sent).toEqual([])
+    expect(result.errors).toHaveLength(maxTx * MAX_ATTEMPTS_PER_TX)
+    expect(result.skipped).toBe(10 - maxTx * MAX_ATTEMPTS_PER_TX)
+  })
+
+  it('fetches one blockhash per tick and reuses it for every exit', async () => {
+    const chain = fakeConnection(chainOf(dueEntries(3)))
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
+
+    expect(result.sent).toHaveLength(3)
+    expect(chain.fake.getLatestBlockhash).toHaveBeenCalledTimes(1)
+    expect(chain.sent.map((tx) => tx.message.recentBlockhash)).toEqual([chain.blockhashes[0], chain.blockhashes[0], chain.blockhashes[0]])
+  })
+
+  it('refreshes the blockhash once and retries when the simulation reports it expired', async () => {
+    const simulate = (_tx: VersionedTransaction, index: number): SimulationValue =>
+      index === 0 ? { err: 'BlockhashNotFound', logs: [] } : { err: null, logs: [] }
+    const chain = fakeConnection(chainOf(dueEntries(2), { simulate }))
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
+
+    expect(result).toEqual({ sent: ['sig-1', 'sig-2'], skipped: 0, errors: [] })
+    expect(chain.fake.getLatestBlockhash).toHaveBeenCalledTimes(2)
+    expect(chain.sent.map((tx) => tx.message.recentBlockhash)).toEqual([chain.blockhashes[1], chain.blockhashes[1]])
+  })
+
+  it('refreshes the blockhash once and resends when the send fails with "blockhash not found"', async () => {
+    const chain = fakeConnection(chainOf([dueEntry()]))
+    chain.fake.sendRawTransaction.mockRejectedValueOnce(new Error('Transaction simulation failed: Blockhash not found'))
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
+
+    expect(result).toEqual({ sent: ['sig-1'], skipped: 0, errors: [] })
+    expect(chain.fake.getLatestBlockhash).toHaveBeenCalledTimes(2)
+    expect(chain.sent[0]?.message.recentBlockhash).toBe(chain.blockhashes[1])
+  })
+
   it('does nothing when the tick has no transaction budget left', async () => {
     const chain = fakeConnection(chainOf([dueEntry()]))
 
@@ -521,21 +661,31 @@ describe('autoExitJob', () => {
     const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
 
     expect(result.sent).toEqual([])
-    expect(result.errors).toHaveLength(1)
-    expect(result.errors[0]).toContain('sig-1')
+    expect(result.errors).toEqual([expect.stringContaining('sig-1')])
   })
 
   it('records an undecodable Position account as an error and still exits the others', async () => {
-    const entry = dueEntry()
-    const base = chainOf([entry])
+    const base = chainOf([dueEntry()])
     const garbage = { address: randomKey(), data: Buffer.from([...POSITION_DISCRIMINATOR, 1, 2, 3]) }
     const chain = fakeConnection({ ...base, positions: [garbage, ...base.positions] })
 
     const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
 
     expect(result.sent).toEqual(['sig-1'])
-    expect(result.errors).toHaveLength(1)
-    expect(result.errors[0]).toContain(garbage.address.toBase58())
+    expect(result.errors).toEqual([expect.stringContaining(garbage.address.toBase58())])
+  })
+
+  it('does not decode a market account the router does not own', async () => {
+    const entry = dueEntry()
+    const base = chainOf([entry])
+    const market = entry.market.address.toBase58()
+    const accounts = new Map([...base.accounts, [market, { data: encodeMarket(entry.market), owner: randomKey() }]])
+    const chain = fakeConnection({ ...base, accounts })
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
+
+    expect(result).toEqual({ sent: [], skipped: 0, errors: [expect.stringContaining(market)] })
+    expect(chain.fake.simulateTransaction).not.toHaveBeenCalled()
   })
 
   it('does not read the progress byte of a pool account the DBC program does not own', async () => {
@@ -552,36 +702,70 @@ describe('autoExitJob', () => {
   })
 
   it('gives up on a confirmation after 45 s, logs the outcome as unknown and does not resend it', async () => {
-    vi.useFakeTimers()
-    try {
-      const log = fakeLog()
-      const chain = fakeConnection(chainOf([dueEntry()]))
-      chain.fake.confirmTransaction.mockImplementationOnce(() => new Promise(() => undefined))
-      let settled = false
+    const log = fakeLog()
+    const chain = fakeConnection(chainOf([dueEntry()]))
+    chain.fake.confirmTransaction.mockImplementationOnce(hang)
 
-      const pending = autoExitJob.run(context(chain.connection, Keypair.generate(), 10, log)).finally(() => {
-        settled = true
-      })
-      await vi.advanceTimersByTimeAsync(CONFIRM_TIMEOUT_MS - 1)
-      expect(settled).toBe(false)
-      await vi.advanceTimersByTimeAsync(1)
-      const result = await pending
+    const run = await runOnFakeTimers(CONFIRM_TIMEOUT_MS, () => autoExitJob.run(context(chain.connection, Keypair.generate(), 10, log)))
 
-      expect(result.sent).toEqual([])
-      expect(result.errors).toEqual([expect.stringMatching(/sig-1 outcome unknown/)])
-      expect(chain.fake.sendTransaction).toHaveBeenCalledTimes(1)
-      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('unknown'), expect.objectContaining({ signature: 'sig-1' }))
-      expect(vi.getTimerCount()).toBe(0)
-    } finally {
-      vi.useRealTimers()
-    }
+    expect(run.settledEarly).toBe(false)
+    expect(run.result.sent).toEqual([])
+    expect(run.result.errors).toEqual([expect.stringMatching(/sig-1 not confirmed .* outcome unknown/)])
+    expect(chain.fake.sendRawTransaction).toHaveBeenCalledTimes(1)
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('unknown'), expect.objectContaining({ reason: expect.stringContaining('sig-1') }))
+    expect(run.timersLeft).toBe(0)
+  })
+
+  it.each([
+    'getProgramAccounts',
+    'getAccountInfo',
+    'getMultipleAccountsInfo',
+    'getLatestBlockhash',
+  ] as const)('bounds %s at 30 s: a timeout becomes an error and nothing is sent', async (call) => {
+    const chain = fakeConnection(chainOf([dueEntry()]))
+    chain.fake[call].mockImplementationOnce(hang)
+
+    const run = await runOnFakeTimers(RPC_TIMEOUT_MS, () => autoExitJob.run(context(chain.connection, Keypair.generate())))
+
+    expect(run.settledEarly).toBe(false)
+    expect(run.result.sent).toEqual([])
+    expect(run.result.errors).toEqual([expect.stringContaining(`timed out after ${RPC_TIMEOUT_MS} ms`)])
+    expect(chain.fake.sendRawTransaction).not.toHaveBeenCalled()
+    expect(run.timersLeft).toBe(0)
+  })
+
+  it('bounds simulateTransaction at 30 s and stops the tick: the RPC is stalled', async () => {
+    const chain = fakeConnection(chainOf(dueEntries(2)))
+    chain.fake.simulateTransaction.mockImplementationOnce(hang)
+
+    const run = await runOnFakeTimers(RPC_TIMEOUT_MS, () => autoExitJob.run(context(chain.connection, Keypair.generate())))
+
+    expect(run.settledEarly).toBe(false)
+    expect(run.result).toEqual({ sent: [], skipped: 1, errors: [expect.stringContaining('simulateTransaction timed out')] })
+    expect(chain.fake.simulateTransaction).toHaveBeenCalledTimes(1)
+    expect(chain.fake.sendRawTransaction).not.toHaveBeenCalled()
+  })
+
+  it('bounds the send at 30 s: the outcome is unknown, it is not resent and the tick stops', async () => {
+    const log = fakeLog()
+    const chain = fakeConnection(chainOf(dueEntries(2)))
+    chain.fake.sendRawTransaction.mockImplementationOnce(hang)
+
+    const run = await runOnFakeTimers(RPC_TIMEOUT_MS, () => autoExitJob.run(context(chain.connection, Keypair.generate(), 10, log)))
+
+    expect(run.settledEarly).toBe(false)
+    expect(run.result).toEqual({ sent: [], skipped: 1, errors: [expect.stringMatching(/sendRawTransaction timed out .* outcome unknown/)] })
+    expect(chain.fake.sendRawTransaction).toHaveBeenCalledTimes(1)
+    expect(chain.fake.confirmTransaction).not.toHaveBeenCalled()
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('unknown'), expect.any(Object))
+    expect(run.timersLeft).toBe(0)
   })
 
   it('reduces RPC URLs in error strings to their host, so a provider key never reaches result.errors', async () => {
     const fetchFails = fakeConnection(chainOf([dueEntry()]))
     fetchFails.fake.getProgramAccounts.mockRejectedValueOnce(new Error(RPC_ERROR))
     const sendFails = fakeConnection(chainOf([dueEntry()]))
-    sendFails.fake.getLatestBlockhash.mockRejectedValueOnce(new Error(RPC_ERROR))
+    sendFails.fake.sendRawTransaction.mockRejectedValueOnce(new Error(RPC_ERROR))
 
     const results = [
       await autoExitJob.run(context(fetchFails.connection, Keypair.generate())),

@@ -6,6 +6,7 @@
  * planAutoExits is pure: one transaction per due position, the most overdue first, each
  * [create the owner's canonical quote ATA (idempotent, paid by the crank), auto_exit].
  * autoExitJob.run fetches the state, plans, then simulates each transaction and sends at most ctx.maxTx of them.
+ * Every RPC call is bounded in wall-clock time, because the tick runner has no tick-level timeout.
  */
 import {
   SYSVAR_CLOCK_PUBKEY,
@@ -13,11 +14,10 @@ import {
   VersionedTransaction,
   type AccountInfo,
   type BlockhashWithExpiryBlockHeight,
-  type Connection,
   type GetProgramAccountsFilter,
   type Keypair,
   type PublicKey,
-  type SimulatedTransactionResponse,
+  type TransactionError,
   type TransactionInstruction,
 } from '@solana/web3.js'
 import { createAssociatedTokenAccountIdempotentInstruction, getAssociatedTokenAddressSync } from '@solana/spl-token'
@@ -36,6 +36,16 @@ import {
 import { errorMessage, redactUrls } from '../../log.js'
 import type { CrankContext, CrankJob, CrankJobResult } from '../index.js'
 
+const JOB_NAME = 'auto-exit'
+const COMMITMENT = 'confirmed'
+/** Wall-clock bound on every RPC request (fetches, blockhash, simulate, send). */
+export const RPC_TIMEOUT_MS = 30_000
+/** Wall-clock bound on one confirmation; past it the outcome is unknown and the exit is not resent this tick. */
+export const CONFIRM_TIMEOUT_MS = 45_000
+/** Simulations per tick are capped at ctx.maxTx times this; due exits over the cap count as skipped. */
+export const MAX_ATTEMPTS_PER_TX = 3
+const TIMED_OUT = Symbol('timed out')
+
 /** sha256("account:Position")[..8]. The SDK keeps it private, so it is duplicated here. */
 const POSITION_DISCRIMINATOR: readonly number[] = Object.freeze([170, 188, 143, 228, 122, 64, 247, 208])
 /** DBC VirtualPool.migration_progress: 0 (PreBondingCurve) is a live curve, anything else is complete. */
@@ -46,8 +56,6 @@ const CLOCK_UNIX_TIMESTAMP_OFFSET = 32
 const CLOCK_SIZE = 40
 /** getMultipleAccounts takes at most 100 keys per call. */
 const MAX_KEYS_PER_CALL = 100
-/** Wall-clock bound on one confirmation; past it the outcome is unknown and the exit is not retried this tick. */
-const CONFIRM_TIMEOUT_MS = 45_000
 /** A deadline of 0 means Auto-Exit is off. */
 const AUTO_EXIT_DISABLED = 0n
 /**
@@ -56,6 +64,9 @@ const AUTO_EXIT_DISABLED = 0n
  * or the curve graduated (AutoExitCurveComplete 6021).
  */
 const RACE_ERROR_CODES: ReadonlySet<number> = new Set([6007, 6020, 6021])
+/** Simulation error of a transaction whose blockhash expired; a send error says the same in words. */
+const BLOCKHASH_NOT_FOUND = 'BlockhashNotFound'
+const BLOCKHASH_NOT_FOUND_MESSAGE = /blockhash not found/i
 
 /**
  * The planner takes no cluster: the router, hook and DBC ids are the same SDK constants on every cluster, and
@@ -87,15 +98,15 @@ function isDue(position: PositionAccount, nowUnix: bigint): boolean {
   return hasDeadline(position) && nowUnix >= (position.autoExitDeadline ?? AUTO_EXIT_DISABLED) && position.tokens > 0n
 }
 
-function compareBigint(a: bigint, b: bigint): number {
-  if (a === b) return 0
-  return a < b ? -1 : 1
+function compare<T extends bigint | string>(a: T, b: T): number {
+  if (a < b) return -1
+  return a > b ? 1 : 0
 }
 
 /** Most overdue first, then by address so the order is deterministic. */
 function byDeadline(a: PositionAccount, b: PositionAccount): number {
-  const order = compareBigint(a.autoExitDeadline ?? AUTO_EXIT_DISABLED, b.autoExitDeadline ?? AUTO_EXIT_DISABLED)
-  return order !== 0 ? order : a.address.toBase58().localeCompare(b.address.toBase58())
+  const order = compare(a.autoExitDeadline ?? AUTO_EXIT_DISABLED, b.autoExitDeadline ?? AUTO_EXIT_DISABLED)
+  return order !== 0 ? order : compare(a.address.toBase58(), b.address.toBase58())
 }
 
 function exitInstructions(
@@ -112,7 +123,7 @@ function exitInstructions(
   ]
 }
 
-/** Null unless the position is due, its market is known and not finalized, and its curve is known to be live. */
+/** Null unless the market is known and not finalized, and its curve is known to be live. */
 function planExit(
   position: PositionAccount,
   markets: ReadonlyMap<string, MarketAccount>,
@@ -158,6 +169,38 @@ export function planAutoExits(
   return planExits(positions, markets, poolProgress, nowUnix, payer).map((exit) => exit.instructions)
 }
 
+/* ---------- bounded RPC ---------- */
+
+class RpcTimeoutError extends Error {
+  constructor(call: string, ms: number) {
+    super(`${call} timed out after ${ms} ms`)
+    this.name = 'RpcTimeoutError'
+  }
+}
+
+/**
+ * Settles with `promise`, or with TIMED_OUT after `ms`. The timer is always cleared. A later rejection of `promise`
+ * stays handled, because Promise.race keeps its subscription.
+ */
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  let timer: NodeJS.Timeout | undefined
+  const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), ms)
+  })
+  try {
+    return await Promise.race([promise, timeout])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** One RPC request bounded by RPC_TIMEOUT_MS; throws RpcTimeoutError when it takes longer. */
+async function rpc<T>(call: string, request: Promise<T>): Promise<T> {
+  const result = await withTimeout(request, RPC_TIMEOUT_MS)
+  if (result === TIMED_OUT) throw new RpcTimeoutError(call, RPC_TIMEOUT_MS)
+  return result
+}
+
 /* ---------- chain state ---------- */
 
 interface Fetched<T> {
@@ -165,17 +208,19 @@ interface Fetched<T> {
   readonly errors: readonly string[]
 }
 
-function requirePlanPrograms(cluster: ClusterConfig): PublicKey {
+function requirePlanPrograms(cluster: ClusterConfig): void {
   const differing = PROGRAM_ID_FIELDS.filter((field) => !cluster[field].equals(PLAN_CLUSTER[field]))
   if (differing.length > 0) {
     throw new Error(`cluster ${cluster.cluster} uses other ${differing.join(', ')} than the SDK constants the planner uses`)
   }
-  return cluster.routerProgramId
 }
 
 /** Every Position with a non-zero deadline; an undecodable account becomes an error, not a failed job. */
-async function fetchDeadlinePositions(connection: Connection, routerProgramId: PublicKey): Promise<Fetched<PositionAccount[]>> {
-  const accounts = await connection.getProgramAccounts(routerProgramId, { filters: [POSITION_FILTER] })
+async function fetchDeadlinePositions(ctx: CrankContext, routerProgramId: PublicKey): Promise<Fetched<PositionAccount[]>> {
+  const accounts = await rpc(
+    'getProgramAccounts',
+    ctx.connection.getProgramAccounts(routerProgramId, { commitment: COMMITMENT, filters: [POSITION_FILTER] }),
+  )
   const decoded = accounts.map(({ pubkey, account }) => {
     try {
       return { position: decodePosition(pubkey, account.data), error: null }
@@ -189,9 +234,9 @@ async function fetchDeadlinePositions(connection: Connection, routerProgramId: P
   }
 }
 
-async function fetchChainUnixTime(connection: Connection): Promise<bigint> {
-  const clock = await connection.getAccountInfo(SYSVAR_CLOCK_PUBKEY)
-  if (clock === null || clock.data.length < CLOCK_SIZE) throw new Error('Clock sysvar unavailable')
+async function fetchChainUnixTime(ctx: CrankContext): Promise<bigint> {
+  const clock = await rpc('getAccountInfo(Clock)', ctx.connection.getAccountInfo(SYSVAR_CLOCK_PUBKEY, COMMITMENT))
+  if (clock === null || clock.data.length < CLOCK_SIZE) throw new Error('Clock sysvar missing or too short')
   return clock.data.readBigInt64LE(CLOCK_UNIX_TIMESTAMP_OFFSET)
 }
 
@@ -200,27 +245,37 @@ function uniqueKeys(keys: readonly PublicKey[]): PublicKey[] {
 }
 
 /** Existing accounts by address (base58), in getMultipleAccounts batches. */
-async function fetchAccounts(connection: Connection, keys: readonly PublicKey[]): Promise<Map<string, AccountInfo<Buffer>>> {
+async function fetchAccounts(ctx: CrankContext, keys: readonly PublicKey[]): Promise<Map<string, AccountInfo<Buffer>>> {
   const batches = Array.from({ length: Math.ceil(keys.length / MAX_KEYS_PER_CALL) }, (_, i) =>
     keys.slice(i * MAX_KEYS_PER_CALL, (i + 1) * MAX_KEYS_PER_CALL),
   )
-  const infos = (await Promise.all(batches.map((batch) => connection.getMultipleAccountsInfo(batch)))).flat()
+  const responses = await Promise.all(
+    batches.map((batch) => rpc('getMultipleAccountsInfo', ctx.connection.getMultipleAccountsInfo(batch, COMMITMENT))),
+  )
+  const infos = responses.flat()
   return new Map(keys.flatMap((key, i) => {
     const info = infos[i]
     return info === null || info === undefined ? [] : [[key.toBase58(), info] as const]
   }))
 }
 
-async function fetchMarkets(connection: Connection, positions: readonly PositionAccount[]): Promise<Fetched<Map<string, MarketAccount>>> {
+/** Markets of `positions`, decoded only from accounts the router owns. */
+async function fetchMarkets(
+  ctx: CrankContext,
+  routerProgramId: PublicKey,
+  positions: readonly PositionAccount[],
+): Promise<Fetched<Map<string, MarketAccount>>> {
   const keys = uniqueKeys(positions.map((position) => position.market))
-  const infos = await fetchAccounts(connection, keys)
+  const infos = await fetchAccounts(ctx, keys)
   const decoded = keys.map((key) => {
-    const info = infos.get(key.toBase58())
-    if (info === undefined) return { market: null, error: `market ${key.toBase58()} not found` }
+    const market = key.toBase58()
+    const info = infos.get(market)
+    if (info === undefined) return { market: null, error: `market ${market} not found` }
+    if (!info.owner.equals(routerProgramId)) return { market: null, error: `market ${market} is not owned by the router` }
     try {
       return { market: decodeMarket(key, info.data), error: null }
     } catch (err) {
-      return { market: null, error: `market ${key.toBase58()}: ${errorMessage(err)}` }
+      return { market: null, error: `market ${market}: ${errorMessage(err)}` }
     }
   })
   return {
@@ -231,12 +286,12 @@ async function fetchMarkets(connection: Connection, positions: readonly Position
 
 /** Migration progress of each market's pool, read only from accounts the DBC program owns. */
 async function fetchPoolProgress(
-  connection: Connection,
+  ctx: CrankContext,
   dbcProgramId: PublicKey,
   markets: Iterable<MarketAccount>,
 ): Promise<Fetched<Map<string, number>>> {
   const keys = uniqueKeys([...markets].map((market) => market.pool))
-  const infos = await fetchAccounts(connection, keys)
+  const infos = await fetchAccounts(ctx, keys)
   const progress = keys.map((key) => {
     const pool = key.toBase58()
     const info = infos.get(pool)
@@ -255,114 +310,178 @@ async function fetchPoolProgress(
 
 type Outcome =
   | { readonly kind: 'sent'; readonly signature: string }
+  /** The chain moved on since the fetch (a race router error): info, not an error. */
   | { readonly kind: 'skipped' }
-  /** Simulation failed: nothing was sent. */
-  | { readonly kind: 'rejected'; readonly error: string }
-  /** An RPC call threw, or the transaction failed on chain; uses the budget so an RPC outage cannot spin the tick. */
-  | { readonly kind: 'failed'; readonly error: string }
-  /** Sent, but not confirmed within CONFIRM_TIMEOUT_MS: it may still land. */
-  | { readonly kind: 'unknown'; readonly error: string }
+  /**
+   * usesBudget: a transaction was (or may have been) sent, or an RPC call failed, so it counts against ctx.maxTx.
+   * halts: an RPC call timed out, so the RPC is treated as stalled and no further exit is tried this tick.
+   */
+  | { readonly kind: 'error'; readonly error: string; readonly usesBudget: boolean; readonly halts: boolean }
 
-type Timed<T> = { readonly timedOut: true } | { readonly timedOut: false; readonly value: T }
+/** The transaction's blockhash expired; the caller refreshes it once and retries. */
+const STALE_BLOCKHASH = Symbol('stale blockhash')
+type Step = Outcome | typeof STALE_BLOCKHASH
 
-/** Settles with the promise, or with timedOut after `ms`; the timer never outlives the race. */
-async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<Timed<T>> {
-  let timer: NodeJS.Timeout | undefined
-  const timeout = new Promise<Timed<T>>((resolve) => {
-    timer = setTimeout(() => resolve({ timedOut: true }), ms)
-  })
-  try {
-    return await Promise.race([promise.then((value): Timed<T> => ({ timedOut: false, value })), timeout])
-  } finally {
-    clearTimeout(timer)
-  }
+interface Attempt {
+  readonly outcome: Outcome
+  readonly blockhash: BlockhashWithExpiryBlockHeight
 }
 
-function buildTransaction(payer: Keypair, instructions: TransactionInstruction[], blockhash: string): VersionedTransaction {
-  const message = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: blockhash, instructions }).compileToV0Message()
+function failure(
+  ctx: CrankContext,
+  exit: PlannedExit,
+  reason: string,
+  flags: { readonly usesBudget: boolean; readonly halts: boolean },
+  msg = 'auto-exit failed',
+): Outcome {
+  const position = exit.position.address.toBase58()
+  ctx.log.warn(msg, { job: JOB_NAME, position, owner: exit.position.owner, market: exit.position.market, reason })
+  return { kind: 'error', error: `position ${position}: ${reason}`, ...flags }
+}
+
+function buildTransaction(payer: Keypair, instructions: readonly TransactionInstruction[], blockhash: string): VersionedTransaction {
+  const message = new TransactionMessage({
+    payerKey: payer.publicKey,
+    recentBlockhash: blockhash,
+    instructions: [...instructions],
+  }).compileToV0Message()
   const tx = new VersionedTransaction(message)
   tx.sign([payer])
   return tx
 }
 
+/** Only the router's own race errors; decodeTxError attributes a failure to the innermost failing program's logs. */
 function isRace(decoded: DecodedTxError | null): boolean {
-  if (decoded === null || decoded.code === null) return false
-  return (decoded.program === 'router' || decoded.program === 'unknown') && RACE_ERROR_CODES.has(decoded.code)
+  return decoded !== null && decoded.program === 'router' && decoded.code !== null && RACE_ERROR_CODES.has(decoded.code)
 }
 
-function simulationOutcome(ctx: CrankContext, exit: PlannedExit, value: SimulatedTransactionResponse): Outcome {
-  const decoded = decodeTxError({ logs: value.logs ?? [], error: value.err })
-  const reason = decoded?.name ?? JSON.stringify(value.err)
-  const fields = { position: exit.position.address, owner: exit.position.owner, market: exit.position.market, reason }
+function describeTxError(err: TransactionError, logs: readonly string[] | null): string {
+  const decoded = decodeTxError({ error: err, logs })
+  return decoded === null ? JSON.stringify(err) : `${decoded.name}: ${decoded.message}`
+}
+
+function simulationOutcome(ctx: CrankContext, exit: PlannedExit, err: TransactionError, logs: readonly string[] | null): Step {
+  if (err === BLOCKHASH_NOT_FOUND) return STALE_BLOCKHASH
+  const decoded = decodeTxError({ error: err, logs })
   if (isRace(decoded)) {
+    const fields = { job: JOB_NAME, position: exit.position.address, owner: exit.position.owner, reason: decoded?.name }
     ctx.log.info('auto-exit skipped: chain state changed since the fetch', fields)
     return { kind: 'skipped' }
   }
-  ctx.log.warn('auto-exit simulation failed', { ...fields, message: decoded?.message, logs: value.logs?.slice(-5) })
-  const detail = decoded === null ? reason : `${reason} (${decoded.message})`
-  return { kind: 'rejected', error: `position ${exit.position.address.toBase58()}: simulation failed: ${detail}` }
+  return failure(ctx, exit, `simulation failed: ${describeTxError(err, logs)}`, { usesBudget: false, halts: false })
 }
 
-async function sendAndConfirm(ctx: CrankContext, exit: PlannedExit, tx: VersionedTransaction, blockhash: BlockhashWithExpiryBlockHeight): Promise<Outcome> {
-  const position = exit.position.address
-  const signature = await ctx.connection.sendTransaction(tx)
-  const confirmation = await withTimeout(ctx.connection.confirmTransaction({ signature, ...blockhash }), CONFIRM_TIMEOUT_MS)
-  if (confirmation.timedOut) {
-    ctx.log.warn('auto-exit outcome unknown: not confirmed in time', { position, signature, timeoutMs: CONFIRM_TIMEOUT_MS })
-    return { kind: 'unknown', error: `position ${position.toBase58()}: transaction ${signature} outcome unknown (not confirmed within ${CONFIRM_TIMEOUT_MS} ms)` }
-  }
-  const err = confirmation.value.value.err
-  if (err !== null) {
-    ctx.log.warn('auto-exit transaction failed', { position, signature, error: err })
-    return { kind: 'failed', error: `position ${position.toBase58()}: transaction ${signature} failed: ${JSON.stringify(err)}` }
-  }
-  ctx.log.info('auto-exit sent', { position, owner: exit.position.owner, market: exit.position.market, signature })
-  return { kind: 'sent', signature }
-}
-
-/** Simulates first; sends only a transaction whose simulation succeeded. Never retried within the tick. */
-async function executeExit(ctx: CrankContext, exit: PlannedExit): Promise<Outcome> {
-  const position = exit.position.address
+/** Never throws. A confirmation past CONFIRM_TIMEOUT_MS is an unknown outcome: logged, not resent this tick. */
+async function confirmExit(
+  ctx: CrankContext,
+  exit: PlannedExit,
+  signature: string,
+  blockhash: BlockhashWithExpiryBlockHeight,
+): Promise<Outcome> {
   try {
-    const blockhash = await ctx.connection.getLatestBlockhash()
-    const tx = buildTransaction(ctx.payer, exit.instructions, blockhash.blockhash)
-    const simulation = await ctx.connection.simulateTransaction(tx)
-    if (simulation.value.err !== null) return simulationOutcome(ctx, exit, simulation.value)
-    return await sendAndConfirm(ctx, exit, tx, blockhash)
+    const strategy = { signature, blockhash: blockhash.blockhash, lastValidBlockHeight: blockhash.lastValidBlockHeight }
+    const confirmation = await withTimeout(ctx.connection.confirmTransaction(strategy, COMMITMENT), CONFIRM_TIMEOUT_MS)
+    if (confirmation === TIMED_OUT) {
+      const reason = `transaction ${signature} not confirmed within ${CONFIRM_TIMEOUT_MS} ms; outcome unknown, not resent this tick`
+      return failure(ctx, exit, reason, { usesBudget: true, halts: true }, 'auto-exit outcome unknown')
+    }
+    const err = confirmation.value.err
+    if (err !== null) return failure(ctx, exit, `transaction ${signature} failed: ${describeTxError(err, null)}`, { usesBudget: true, halts: false })
+    ctx.log.info('auto-exit sent', { job: JOB_NAME, position: exit.position.address, owner: exit.position.owner, signature })
+    return { kind: 'sent', signature }
   } catch (err) {
-    ctx.log.warn('auto-exit send failed', { position, error: errorMessage(err) })
-    return { kind: 'failed', error: `position ${position.toBase58()}: ${errorMessage(err)}` }
+    return failure(ctx, exit, `transaction ${signature}: ${errorMessage(err)}`, { usesBudget: true, halts: false })
   }
 }
 
-const usesBudget = (outcome: Outcome): boolean => outcome.kind !== 'skipped' && outcome.kind !== 'rejected'
-const errorOf = (outcome: Outcome): string[] => ('error' in outcome ? [outcome.error] : [])
+/** Simulates, then sends (no preflight: it would repeat the simulation) and confirms. Never throws. */
+async function executeExit(ctx: CrankContext, exit: PlannedExit, blockhash: BlockhashWithExpiryBlockHeight): Promise<Step> {
+  const tx = buildTransaction(ctx.payer, exit.instructions, blockhash.blockhash)
+  try {
+    const simulation = await rpc('simulateTransaction', ctx.connection.simulateTransaction(tx, { commitment: COMMITMENT }))
+    if (simulation.value.err !== null) return simulationOutcome(ctx, exit, simulation.value.err, simulation.value.logs)
+  } catch (err) {
+    return failure(ctx, exit, `simulation: ${errorMessage(err)}`, { usesBudget: false, halts: err instanceof RpcTimeoutError })
+  }
+  try {
+    const signature = await rpc('sendRawTransaction', ctx.connection.sendRawTransaction(tx.serialize(), { skipPreflight: true }))
+    return await confirmExit(ctx, exit, signature, blockhash)
+  } catch (err) {
+    if (err instanceof RpcTimeoutError) {
+      const reason = `${err.message}; outcome unknown, not resent this tick`
+      return failure(ctx, exit, reason, { usesBudget: true, halts: true }, 'auto-exit outcome unknown')
+    }
+    if (BLOCKHASH_NOT_FOUND_MESSAGE.test(errorMessage(err))) return STALE_BLOCKHASH
+    return failure(ctx, exit, `send failed: ${errorMessage(err)}`, { usesBudget: true, halts: false })
+  }
+}
 
-/** Tries the exits in order until maxTx transactions went out; simulation failures do not use the budget. */
+async function latestBlockhash(ctx: CrankContext): Promise<BlockhashWithExpiryBlockHeight> {
+  return rpc('getLatestBlockhash', ctx.connection.getLatestBlockhash(COMMITMENT))
+}
+
+/** One exit with the tick's blockhash; if that blockhash expired, refreshes it once and retries the exit once. */
+async function attemptExit(ctx: CrankContext, exit: PlannedExit, blockhash: BlockhashWithExpiryBlockHeight): Promise<Attempt> {
+  const first = await executeExit(ctx, exit, blockhash)
+  if (first !== STALE_BLOCKHASH) return { outcome: first, blockhash }
+  try {
+    const fresh = await latestBlockhash(ctx)
+    const second = await executeExit(ctx, exit, fresh)
+    const outcome = second !== STALE_BLOCKHASH
+      ? second
+      : failure(ctx, exit, 'blockhash not found, even after a refresh', { usesBudget: false, halts: false })
+    return { outcome, blockhash: fresh }
+  } catch (err) {
+    const halts = err instanceof RpcTimeoutError
+    return { outcome: failure(ctx, exit, `blockhash refresh: ${errorMessage(err)}`, { usesBudget: true, halts }), blockhash }
+  }
+}
+
+const usesBudget = (outcome: Outcome): boolean => outcome.kind === 'sent' || (outcome.kind === 'error' && outcome.usesBudget)
+const halts = (outcome: Outcome): boolean => outcome.kind === 'error' && outcome.halts
+
+function mayContinue(ctx: CrankContext, outcomes: readonly Outcome[]): boolean {
+  return (
+    outcomes.length < ctx.maxTx * MAX_ATTEMPTS_PER_TX &&
+    outcomes.filter(usesBudget).length < ctx.maxTx &&
+    !outcomes.some(halts)
+  )
+}
+
+/**
+ * Tries the exits in order with one blockhash per tick, until maxTx transactions went out, maxTx * 3 exits were
+ * tried, or an RPC call timed out. Exits not tried count as skipped.
+ */
 async function executeExits(ctx: CrankContext, exits: readonly PlannedExit[]): Promise<CrankJobResult> {
+  if (exits.length === 0) return { sent: [], skipped: 0, errors: [] }
+  let blockhash: BlockhashWithExpiryBlockHeight
+  try {
+    blockhash = await latestBlockhash(ctx)
+  } catch (err) {
+    return { sent: [], skipped: exits.length, errors: [`${JOB_NAME}: ${errorMessage(err)}`] }
+  }
   let outcomes: readonly Outcome[] = []
   for (const exit of exits) {
-    if (outcomes.filter(usesBudget).length >= ctx.maxTx) break
-    outcomes = [...outcomes, await executeExit(ctx, exit)]
+    if (!mayContinue(ctx, outcomes)) break
+    const attempt = await attemptExit(ctx, exit, blockhash)
+    outcomes = [...outcomes, attempt.outcome]
+    blockhash = attempt.blockhash
   }
   return {
     sent: outcomes.flatMap((o) => (o.kind === 'sent' ? [o.signature] : [])),
     skipped: exits.length - outcomes.length + outcomes.filter((o) => o.kind === 'skipped').length,
-    errors: outcomes.flatMap(errorOf),
+    errors: outcomes.flatMap((o) => (o.kind === 'error' ? [o.error] : [])),
   }
 }
 
 async function runAutoExits(ctx: CrankContext): Promise<CrankJobResult> {
   if (ctx.maxTx <= 0) return { sent: [], skipped: 0, errors: [] }
   const cluster = ctx.cluster
-  const routerProgramId = requirePlanPrograms(cluster)
-  const [positions, nowUnix] = await Promise.all([
-    fetchDeadlinePositions(ctx.connection, routerProgramId),
-    fetchChainUnixTime(ctx.connection),
-  ])
+  requirePlanPrograms(cluster)
+  const [positions, nowUnix] = await Promise.all([fetchDeadlinePositions(ctx, cluster.routerProgramId), fetchChainUnixTime(ctx)])
   const due = positions.value.filter((position) => isDue(position, nowUnix))
-  const markets = await fetchMarkets(ctx.connection, due)
-  const poolProgress = await fetchPoolProgress(ctx.connection, cluster.dbcProgramId, markets.value.values())
+  const markets = await fetchMarkets(ctx, cluster.routerProgramId, due)
+  const poolProgress = await fetchPoolProgress(ctx, cluster.dbcProgramId, markets.value.values())
   const exits = planExits(due, markets.value, poolProgress.value, nowUnix, ctx.payer.publicKey)
   const executed = await executeExits(ctx, exits)
   return { ...executed, errors: [...positions.errors, ...markets.errors, ...poolProgress.errors, ...executed.errors] }
@@ -373,13 +492,14 @@ function redactErrors(result: CrankJobResult): CrankJobResult {
   return { ...result, errors: result.errors.map(redactUrls) }
 }
 
+/** Exits every due position on a live curve (simulated first), at most ctx.maxTx per tick. Never throws. */
 export const autoExitJob: CrankJob = Object.freeze({
-  name: 'auto-exit',
+  name: JOB_NAME,
   async run(ctx: CrankContext): Promise<CrankJobResult> {
     try {
       return redactErrors(await runAutoExits(ctx))
     } catch (err) {
-      return redactErrors({ sent: [], skipped: 0, errors: [`auto-exit: ${errorMessage(err)}`] })
+      return redactErrors({ sent: [], skipped: 0, errors: [`${JOB_NAME}: ${errorMessage(err)}`] })
     }
   },
 })
