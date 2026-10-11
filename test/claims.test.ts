@@ -552,7 +552,7 @@ describe('claimsJob', () => {
     const result = await claimsJob.run(makeContext(fake, 10))
 
     expect(result).toEqual({ sent: [], skipped: 0, errors: [] })
-    expect(fake.getProgramAccounts).toHaveBeenCalledTimes(1)
+    expect(fake.getProgramAccounts).toHaveBeenCalledTimes(2)
     expect(fake.sendTransaction).not.toHaveBeenCalled()
   })
 
@@ -562,7 +562,7 @@ describe('claimsJob', () => {
 
     await claimsJob.run(makeContext(fake, 10))
 
-    const [programId, config] = fake.getProgramAccounts.mock.calls[1] ?? []
+    const [programId, config] = fake.getProgramAccounts.mock.calls[2] ?? []
     expect(programId?.equals(ROUTER)).toBe(true)
     expect(config?.filters).toEqual([
       { memcmp: { offset: 0, bytes: Buffer.from(POSITION_DISCRIMINATOR).toString('base64'), encoding: 'base64' } },
@@ -732,7 +732,7 @@ describe('claimsJob', () => {
     expect(results).toEqual([{ sent: [], skipped: 0, errors: [] }, { sent: [], skipped: 0, errors: [] }])
     expect(log.warn).toHaveBeenCalledTimes(1)
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('quote mint'), expect.objectContaining({ quoteMint: market.quoteMint.toBase58() }))
-    expect(fake.getProgramAccounts).toHaveBeenCalledTimes(2) // the market scans only: no position read
+    expect(fake.getProgramAccounts).toHaveBeenCalledTimes(4) // the market scans only: no position read
     expect(fake.sendTransaction).not.toHaveBeenCalled()
   })
 
@@ -777,7 +777,7 @@ describe('claimsJob', () => {
 
     const result = await claimsJob.run(makeContext(fake, 1))
 
-    expect(fake.getProgramAccounts).toHaveBeenCalledTimes(2)
+    expect(fake.getProgramAccounts).toHaveBeenCalledTimes(3)
     expect(result).toEqual({ sent: ['sig-1'], skipped: 2, errors: [] })
   })
 
