@@ -13,6 +13,12 @@
  * swap_base_amount) before they are sent. Trader SOL (wallet plus wSOL ATA) is swept back to the payer at the end,
  * also when a step fails. Market base-token ATAs and the positions of the live markets stay: that is the demo data.
  *
+ * Migration race (OPS-28): migration_damm_v2 is permissionless, so the hosted crank (or any keeper) may migrate the
+ * graduated pool before this script does. When the pool is already migrated (is_migrated set, or migration_progress
+ * CreatedPool), before the send or after a failed one, the migrate step logs 'already migrated', records the
+ * migration transaction it finds on the DAMM v2 pool (graduation.migratedByOtherKey) and the run continues. Any other
+ * migrate failure still fails the run.
+ *
  * Known devnet bug (not handled here): sdk fetchAllMarkets and the crank jobs throw on two legacy 241-byte markets,
  * so this script reads only the markets it creates (fetchMarket) and calls the instruction builders directly.
  *
@@ -31,7 +37,7 @@
  * Exit code: 0 when the three markets end live / live (>= 7000 bps) / migrated, 1 otherwise.
  */
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { crc32, deflateSync } from 'node:zlib'
@@ -119,6 +125,8 @@ const TRADER_FLOAT_LAMPORTS = 2_000_000n
 const MAX_SEND_ATTEMPTS = 3
 const MAX_BUYS_PER_FILL = 150
 const LOG_TAIL_LINES = 8
+/** getSignaturesForAddress returns at most 1000 signatures per page. */
+const SIGNATURE_PAGE_LIMIT = 1_000
 
 /** DBC MigrationProgress (worker/src/crank/jobs/migrate.ts). */
 const PRE_BONDING_CURVE = 0
@@ -199,9 +207,10 @@ interface LiveMarket {
   readonly threshold: bigint
 }
 
-interface CurveState {
+export interface CurveState {
   readonly quoteReserve: bigint
   readonly migrationProgress: number
+  /** Migrated by anyone: is_migrated is set or migration_progress is CreatedPool. */
   readonly isMigrated: boolean
 }
 
@@ -221,7 +230,10 @@ interface Metadata {
 interface Graduation {
   readonly finalize: string
   readonly claims: readonly { readonly owner: string; readonly signature: string }[]
-  readonly migrate: string
+  /** The migration_damm_v2 transaction; null when another key migrated the pool and its transaction was not found. */
+  readonly migrate: string | null
+  /** True when another key (e.g. the hosted crank) migrated the pool before this script did. */
+  readonly migratedByOtherKey: boolean
   readonly dammConfig: string
   readonly dammPool: string
 }
@@ -612,25 +624,79 @@ async function claimAll(ctx: Ctx, m: LiveMarket): Promise<Graduation['claims']> 
   return claims
 }
 
-/** migration_damm_v2 through the DBC SDK, as litesvm-diff/src/migrate_devnet.ts (ONC-10). */
-async function migrateToDammV2(ctx: Ctx, m: LiveMarket): Promise<Pick<Graduation, 'migrate' | 'dammConfig' | 'dammPool'>> {
-  const config = await readConfig(ctx, m.market.config)
-  const dammConfig = DAMM_V2_MIGRATION_FEE_ADDRESS[config.migrationFeeOption]
-  if (dammConfig === undefined) throw new Error(`migration fee option ${config.migrationFeeOption} has no DAMM v2 config`)
-  const curve = await readCurve(ctx, m.market.pool)
-  if (curve.migrationProgress !== LOCKED_VESTING || curve.isMigrated) {
+/** Chain access of the migrate step; the seed run reads and sends on devnet, tests replace each one. */
+export interface MigrateStepDeps {
+  readonly readCurve: () => Promise<CurveState>
+  /** Builds and sends migration_damm_v2, resolving with its signature. */
+  readonly sendMigration: () => Promise<string>
+  /** The transaction that migrated the pool, null when it cannot be found. */
+  readonly findMigration: () => Promise<string | null>
+}
+
+export type MigrateStepResult = Pick<Graduation, 'migrate' | 'migratedByOtherKey'>
+
+/** The pool was migrated by another key: logs 'already migrated' with the migration found (best effort). */
+async function adoptMigration(pool: PublicKey, curve: CurveState, deps: MigrateStepDeps): Promise<MigrateStepResult> {
+  const migrate = await deps.findMigration().catch((err: unknown) => {
+    log.warn('cannot look up the migrate transaction of the other key', { pool, error: scrub(errorMessage(err)) })
+    return null
+  })
+  log.info('already migrated', { pool, migrationProgress: curve.migrationProgress, isMigrated: curve.isMigrated, migrate })
+  return { migrate, migratedByOtherKey: true }
+}
+
+/**
+ * Migrates `pool`, or adopts the migration of another key (the hosted crank may get there first): before the send
+ * when the pool is already migrated, after a failed send when a re-read shows it migrated. Any other failure throws.
+ */
+export async function runMigrateStep(pool: PublicKey, deps: MigrateStepDeps): Promise<MigrateStepResult> {
+  const curve = await deps.readCurve()
+  if (curve.isMigrated) return adoptMigration(pool, curve, deps)
+  if (curve.migrationProgress !== LOCKED_VESTING) {
     throw new Error(`pool is not ready to migrate (migrationProgress ${curve.migrationProgress}, isMigrated ${curve.isMigrated})`)
   }
+  try {
+    return { migrate: await deps.sendMigration(), migratedByOtherKey: false }
+  } catch (err) {
+    const after = await deps.readCurve().catch((readErr: unknown) => {
+      log.warn('cannot re-read the pool after a failed migrate', { pool, error: scrub(errorMessage(readErr)) })
+      return null
+    })
+    if (after?.isMigrated === true) return adoptMigration(pool, after, deps)
+    throw err
+  }
+}
+
+/** migration_damm_v2 through the DBC SDK, as litesvm-diff/src/migrate_devnet.ts (ONC-10). */
+async function sendMigration(ctx: Ctx, pool: PublicKey, dammConfig: PublicKey): Promise<string> {
   const client = new DynamicBondingCurveClient(ctx.connection, COMMITMENT)
-  const migration = await client.migration.migrateToDammV2({ payer: ctx.payer.publicKey, pool: m.market.pool, dammConfig })
+  const migration = await client.migration.migrateToDammV2({ payer: ctx.payer.publicKey, pool, dammConfig })
   const ixs = migration.transaction.instructions
   const isSigner = (key: PublicKey): boolean => ixs.some((ix) => ix.keys.some((meta) => meta.isSigner && meta.pubkey.equals(key)))
   const nftSigners = [migration.firstPositionNftKeypair, migration.secondPositionNftKeypair].filter((kp) => isSigner(kp.publicKey))
-  const signature = await send(ctx, 'migrate', ixs, nftSigners)
+  return send(ctx, 'migrate', ixs, nftSigners)
+}
+
+/** The oldest successful transaction on `dammPool`, the migration that created it; null when the page is full. */
+async function findPoolCreation(ctx: Ctx, dammPool: PublicKey): Promise<string | null> {
+  const history = await ctx.connection.getSignaturesForAddress(dammPool, { limit: SIGNATURE_PAGE_LIMIT }, COMMITMENT)
+  if (history.length >= SIGNATURE_PAGE_LIMIT) return null
+  return history.filter((entry) => entry.err === null).at(-1)?.signature ?? null
+}
+
+async function migrateToDammV2(ctx: Ctx, m: LiveMarket): Promise<Omit<Graduation, 'finalize' | 'claims'>> {
+  const config = await readConfig(ctx, m.market.config)
+  const dammConfig = DAMM_V2_MIGRATION_FEE_ADDRESS[config.migrationFeeOption]
+  if (dammConfig === undefined) throw new Error(`migration fee option ${config.migrationFeeOption} has no DAMM v2 config`)
   const dammPool = deriveDammV2PoolAddress(dammConfig, m.market.baseMint, m.market.quoteMint)
+  const step = await runMigrateStep(m.market.pool, {
+    readCurve: () => readCurve(ctx, m.market.pool),
+    sendMigration: () => sendMigration(ctx, m.market.pool, dammConfig),
+    findMigration: () => findPoolCreation(ctx, dammPool),
+  })
   const info = await ctx.connection.getAccountInfo(dammPool, COMMITMENT)
   if (info === null || !info.owner.equals(DAMM_V2_PROGRAM_ID)) throw new Error(`DAMM v2 pool ${dammPool.toBase58()} missing after migration`)
-  return { migrate: signature, dammConfig: dammConfig.toBase58(), dammPool: dammPool.toBase58() }
+  return { ...step, dammConfig: dammConfig.toBase58(), dammPool: dammPool.toBase58() }
 }
 
 async function graduate(ctx: Ctx, m: LiveMarket): Promise<Graduation> {
@@ -640,7 +706,7 @@ async function graduate(ctx: Ctx, m: LiveMarket): Promise<Graduation> {
   const claims = await claimAll(ctx, m)
   log.info('finalized and claimed', { market: m.market.address.toBase58(), claims: claims.length })
   const migration = await migrateToDammV2(ctx, m)
-  log.info('migrated to DAMM v2', { market: m.market.address.toBase58(), dammPool: migration.dammPool })
+  log.info('migrated to DAMM v2', { market: m.market.address.toBase58(), dammPool: migration.dammPool, migratedByOtherKey: migration.migratedByOtherKey })
   return { finalize, claims, ...migration }
 }
 
@@ -770,12 +836,25 @@ async function main(): Promise<number> {
   return failed.length === 0 && sweep.every((row) => row.error === undefined) ? 0 : 1
 }
 
-main().then(
-  (code) => {
-    process.exitCode = code
-  },
-  (err: unknown) => {
-    log.error('seed-devnet failed', { error: scrub(errorMessage(err)) })
-    process.exitCode = 1
-  },
-)
+/** True when node started this file (npx tsx scripts/seed-devnet.ts); false when a test imports it. */
+function isEntrypoint(script: string | undefined): boolean {
+  if (script === undefined) return false
+  try {
+    return realpathSync(script) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    log.warn('cannot resolve the start script; seed-devnet does not run')
+    return false
+  }
+}
+
+if (isEntrypoint(process.argv[1])) {
+  main().then(
+    (code) => {
+      process.exitCode = code
+    },
+    (err: unknown) => {
+      log.error('seed-devnet failed', { error: scrub(errorMessage(err)) })
+      process.exitCode = 1
+    },
+  )
+}
