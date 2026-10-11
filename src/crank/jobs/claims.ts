@@ -9,9 +9,10 @@
  * number of calls per tick.
  *
  * ATA rent guard (CRK-10): an owner can close the ATA the crank paid for and keep its rent, so a missing ATA is created
- * only when the surplus share is at least minAtaValueLamports, and at most maxAtaCreatesPerTick ATAs are created per
- * tick. Any other claim with a missing ATA is skipped (left to the owner) without using the tick's budget. While the
- * payer holds less than crankMinSolLamports, the job plans nothing.
+ * only when the surplus share reaches its quote mint's minimum (quoteMinimums: wSOL from minAtaValueLamports, xStocks
+ * in raw units), and at most maxAtaCreatesPerTick ATAs are created per tick. Any other claim with a missing ATA is
+ * skipped (left to the owner) without using the tick's budget. Markets of a quote mint without minimums are skipped.
+ * While the payer holds less than crankMinSolLamports, the job plans nothing.
  */
 import { Buffer } from 'node:buffer'
 import {
@@ -45,7 +46,7 @@ import {
   type MarketAccounts,
   type PositionAccount,
 } from '@trucee/sdk'
-import { DEFAULT_MIN_ATA_VALUE_LAMPORTS, defaultCrankGuards, type CrankGuards } from '../../config.js'
+import { defaultCrankGuards, quoteMinimums, type CrankGuards } from '../../config.js'
 import { errorMessage, redactUrls } from '../../log.js'
 import type { CrankContext, CrankJob, CrankJobResult } from '../index.js'
 
@@ -71,9 +72,8 @@ const QUOTE_TOKEN_PROGRAMS: readonly PublicKey[] = Object.freeze([TOKEN_PROGRAM_
 const DEFAULT_CLUSTER: ClusterConfig = getClusterConfig('devnet')
 const TIMED_OUT: unique symbol = Symbol('timed out')
 const U64_MAX = (1n << 64n) - 1n
-
-/** The guards this job applies (CRK-10); WorkerConfig satisfies it. */
-export type ClaimsGuards = Pick<CrankGuards, 'minAtaValueLamports' | 'maxAtaCreatesPerTick' | 'crankMinSolLamports'>
+/** Default minimums of the pure planner: mainnet-beta lists every quote mint, and ATA minimums match on every cluster. */
+const DEFAULT_QUOTE_MINIMUMS = quoteMinimums(defaultCrankGuards('mainnet-beta'), getClusterConfig('mainnet-beta').quoteMints)
 
 /* ---------- planner ---------- */
 
@@ -111,7 +111,7 @@ function planClaim(
   ownerQuoteAtaExists: ReadonlyMap<string, boolean>,
   payer: PublicKey,
   cluster: ClusterConfig,
-  minAtaValueLamports: bigint,
+  minAtaValue: bigint | null,
 ): TransactionInstruction[] {
   const owner = position.owner
   const ownerQuote = ownerQuoteAta(accounts, owner)
@@ -121,7 +121,7 @@ function planClaim(
     throw new Error(`claim_surplus for owner ${owner.toBase58()} does not pay the owner's canonical quote ATA`)
   }
   if (ownerQuoteAtaExists.get(ownerQuote.toBase58()) === true) return [claim]
-  if (surplusShare(market, position) < minAtaValueLamports) return []
+  if (minAtaValue === null || surplusShare(market, position) < minAtaValue) return []
   const createAta = createAssociatedTokenAccountIdempotentInstruction(
     payer, ownerQuote, owner, accounts.quoteMint, accounts.quoteTokenProgram,
   )
@@ -131,11 +131,12 @@ function planClaim(
 /**
  * One transaction per position, in input order: claim_surplus with `payer` as cranker, preceded by an idempotent
  * creation (paid by `payer`) of the owner's canonical quote ATA unless `ownerQuoteAtaExists` maps that ATA's
- * base58 address to true. A position whose ATA is missing and whose surplus share is below `minAtaValueLamports`
- * gets an empty list (no transaction). Plans nothing until the market is finalized.
+ * base58 address to true. A position whose ATA is missing and whose surplus share is below `minAtaValue` gets an
+ * empty list (no transaction). Plans nothing until the market is finalized.
  *
  * @param cluster program ids for the instructions; defaults to the SDK's, which are the same on every cluster.
- * @param minAtaValueLamports least surplus share for which the crank creates (pays the rent of) a missing quote ATA.
+ * @param minAtaValue least surplus share (raw quote units) for which the crank creates (pays the rent of) a missing
+ *   quote ATA; null never creates one. Defaults to the default minimum of the market's quote mint (null if it has none).
  * @throws when `quoteTokenProgram` is not SPL Token or Token-2022, when a position belongs to another market,
  *   when a position owner is off the ed25519 curve (no canonical ATA can be derived for it), or when the SDK's
  *   claim instruction would pay any account other than the owner's canonical quote ATA.
@@ -147,12 +148,12 @@ export function planClaims(
   payer: PublicKey,
   quoteTokenProgram: PublicKey,
   cluster: ClusterConfig = DEFAULT_CLUSTER,
-  minAtaValueLamports: bigint = DEFAULT_MIN_ATA_VALUE_LAMPORTS,
+  minAtaValue: bigint | null = DEFAULT_QUOTE_MINIMUMS.get(market.quoteMint.toBase58())?.ataValue ?? null,
 ): TransactionInstruction[][] {
   if (!market.finalized) return []
   const accounts = marketAccountsFor(market, requireQuoteTokenProgram(quoteTokenProgram))
   return positions.map((position) =>
-    planClaim(accounts, market, requirePositionOf(market, position), ownerQuoteAtaExists, payer, cluster, minAtaValueLamports),
+    planClaim(accounts, market, requirePositionOf(market, position), ownerQuoteAtaExists, payer, cluster, minAtaValue),
   )
 }
 
@@ -252,14 +253,17 @@ function quoteTokenProgramOf(cluster: ClusterConfig, market: MarketAccount): Pub
 
 const isOnCurve = (owner: PublicKey): boolean => PublicKey.isOnCurve(owner.toBytes())
 
-/** Off-curve positions a job remembers having warned about; past this, the oldest may be warned about again. */
-export const MAX_REPORTED_OFF_CURVE = 10_000
+/** Keys (positions, quote mints) a job remembers having warned about; past this, the oldest may be warned about again. */
+export const MAX_REPORTED_KEYS = 10_000
 
 /** A set of string keys with a fixed capacity. */
 export interface BoundedKeySet {
   has(key: string): boolean
-  /** Remembers `key`; past the capacity the oldest key is forgotten. A known key keeps its place. */
-  add(key: string): void
+  /**
+   * Remembers `key` and returns true when it was not known; past the capacity the oldest key is forgotten. A known key
+   * keeps its place and returns false.
+   */
+  add(key: string): boolean
   size(): number
 }
 
@@ -272,12 +276,14 @@ export function createBoundedKeySet(capacity: number): BoundedKeySet {
   const keys = new Set<string>()
   return Object.freeze({
     has: (key: string): boolean => keys.has(key),
-    add(key: string): void {
-      if (keys.has(key)) return
+    add(key: string): boolean {
+      if (keys.has(key)) return false
       keys.add(key)
-      if (keys.size <= capacity) return
-      const oldest = keys.values().next()
-      if (oldest.done !== true) keys.delete(oldest.value)
+      if (keys.size > capacity) {
+        const oldest = keys.values().next()
+        if (oldest.done !== true) keys.delete(oldest.value)
+      }
+      return true
     },
     size: (): number => keys.size,
   })
@@ -290,12 +296,26 @@ export function createBoundedKeySet(capacity: number): BoundedKeySet {
 function reportOffCurve(ctx: CrankContext, reported: BoundedKeySet, positions: readonly PositionAccount[]): void {
   for (const position of positions) {
     const address = position.address.toBase58()
-    if (reported.has(address)) continue
-    reported.add(address)
+    if (!reported.add(address)) continue
     ctx.log.warn('claims: owner is off curve; skipped', {
       market: position.market.toBase58(), position: address, owner: position.owner.toBase58(),
     })
   }
+}
+
+/** A market whose quote mint has no crank minimums is skipped every tick; its mint is warned about once per instance. */
+function reportUnknownQuote(ctx: CrankContext, reported: BoundedKeySet, market: MarketAccount): void {
+  const quoteMint = market.quoteMint.toBase58()
+  if (!reported.add(quoteMint)) return
+  ctx.log.warn('claims: quote mint has no crank minimums; its markets are skipped', {
+    quoteMint, market: market.address.toBase58(),
+  })
+}
+
+/** What a job instance has warned about, so each warning is logged once per instance. */
+interface Warned {
+  readonly offCurve: BoundedKeySet
+  readonly unknownQuotes: BoundedKeySet
 }
 
 /* ---------- per-market plan ---------- */
@@ -325,7 +345,7 @@ async function readAndPlanMarket(
   ctx: CrankContext,
   cluster: ClusterConfig,
   market: MarketAccount,
-  minAtaValueLamports: bigint,
+  minAtaValue: bigint,
 ): Promise<MarketPlan> {
   const quoteTokenProgram = quoteTokenProgramOf(cluster, market)
   const fetched = await fetchMarketPositions(ctx.connection, cluster.routerProgramId, market)
@@ -334,7 +354,7 @@ async function readAndPlanMarket(
   const accounts = marketAccountsFor(market, quoteTokenProgram)
   const atas = claimable.map((position) => ownerQuoteAta(accounts, position.owner))
   const ataExists = await fetchAtaExistence(ctx.connection, atas, quoteTokenProgram)
-  const plan = planClaims(market, claimable, ataExists, ctx.payer.publicKey, quoteTokenProgram, cluster, minAtaValueLamports)
+  const plan = planClaims(market, claimable, ataExists, ctx.payer.publicKey, quoteTokenProgram, cluster, minAtaValue)
   if (plan.length !== claimable.length) {
     throw new Error(`planned ${plan.length} claims for ${claimable.length} positions`)
   }
@@ -351,10 +371,10 @@ async function planMarket(
   ctx: CrankContext,
   cluster: ClusterConfig,
   market: MarketAccount,
-  minAtaValueLamports: bigint,
+  minAtaValue: bigint,
 ): Promise<MarketPlan> {
   try {
-    return await readAndPlanMarket(ctx, cluster, market, minAtaValueLamports)
+    return await readAndPlanMarket(ctx, cluster, market, minAtaValue)
   } catch (err) {
     const errors = [`market ${market.address.toBase58()}: ${errorMessage(err)}`]
     return { claims: [], skipped: 0, belowMinValue: 0, offCurve: [], errors }
@@ -504,9 +524,11 @@ function attemptable(claims: readonly PlannedClaim[], maxAtaCreates: number): nu
 
 /**
  * Reads and plans finalized markets in order until there are enough claims to fill the tick's attempt cap. Claims
- * skipped for a missing ATA (below the value or over the create cap) do not count toward it.
+ * skipped for a missing ATA (below the value or over the create cap) do not count toward it. A market whose quote
+ * mint has no crank minimums is skipped without reading its positions.
  */
-async function planTick(ctx: CrankContext, cluster: ClusterConfig, guards: ClaimsGuards): Promise<MarketPlan> {
+async function planTick(ctx: CrankContext, cluster: ClusterConfig, guards: CrankGuards, warned: Warned): Promise<MarketPlan> {
+  const minimums = quoteMinimums(guards, cluster.quoteMints)
   const markets = await rpc(fetchAllMarkets(ctx.connection, cluster.routerProgramId), 'fetchAllMarkets')
   let claims: readonly PlannedClaim[] = []
   let skipped = 0
@@ -515,7 +537,12 @@ async function planTick(ctx: CrankContext, cluster: ClusterConfig, guards: Claim
   let errors: readonly string[] = []
   for (const market of markets.filter((candidate) => candidate.finalized)) {
     if (attemptable(claims, guards.maxAtaCreatesPerTick) >= maxAttempts(ctx.maxTx)) break
-    const plan = await planMarket(ctx, cluster, market, guards.minAtaValueLamports)
+    const quote = minimums.get(market.quoteMint.toBase58())
+    if (quote === undefined) {
+      reportUnknownQuote(ctx, warned.unknownQuotes, market)
+      continue
+    }
+    const plan = await planMarket(ctx, cluster, market, quote.ataValue)
     claims = [...claims, ...plan.claims]
     skipped += plan.skipped
     belowMinValue += plan.belowMinValue
@@ -565,27 +592,22 @@ async function payerAboveFloor(ctx: CrankContext, minLamports: bigint): Promise<
 }
 
 /** One line per tick for the claims left to their owners because their quote ATA is missing; no owner is named. */
-function logAtaSkips(ctx: CrankContext, guards: ClaimsGuards, belowMinValue: number, overCreateCap: number): void {
+function logAtaSkips(ctx: CrankContext, guards: CrankGuards, belowMinValue: number, overCreateCap: number): void {
   if (belowMinValue + overCreateCap === 0) return
   ctx.log.info('claims: quote ATA missing; claims left to their owners this tick', {
     belowMinValue,
     overCreateCap,
-    minAtaValueLamports: guards.minAtaValueLamports,
     maxAtaCreatesPerTick: guards.maxAtaCreatesPerTick,
   })
 }
 
-async function runClaims(
-  ctx: CrankContext,
-  configured: ClaimsGuards | undefined,
-  reportedOffCurve: BoundedKeySet,
-): Promise<CrankJobResult> {
+async function runClaims(ctx: CrankContext, configured: CrankGuards | undefined, warned: Warned): Promise<CrankJobResult> {
   if (ctx.maxTx <= 0) return toResult(EMPTY_TALLY)
   const cluster = ctx.cluster
   const guards = configured ?? defaultCrankGuards(cluster.cluster)
   if (!(await payerAboveFloor(ctx, guards.crankMinSolLamports))) return toResult(EMPTY_TALLY)
-  const plan = await planTick(ctx, cluster, guards)
-  reportOffCurve(ctx, reportedOffCurve, plan.offCurve)
+  const plan = await planTick(ctx, cluster, guards, warned)
+  reportOffCurve(ctx, warned.offCurve, plan.offCurve)
   const planned = withErrors(withSkipped(EMPTY_TALLY, plan.skipped), plan.errors)
   const sent = plan.claims.length === 0 ? planned : await sendClaims(ctx, plan.claims, planned, guards.maxAtaCreatesPerTick)
   logAtaSkips(ctx, guards, plan.belowMinValue, sent.overCreateCap)
@@ -596,13 +618,16 @@ async function runClaims(
  * The claims job within `guards`. Without `guards` it uses defaultCrankGuards for ctx.cluster; the worker passes its
  * WorkerConfig. Never throws.
  */
-export function createClaimsJob(guards?: ClaimsGuards): CrankJob {
-  const reportedOffCurve = createBoundedKeySet(MAX_REPORTED_OFF_CURVE)
+export function createClaimsJob(guards?: CrankGuards): CrankJob {
+  const warned: Warned = Object.freeze({
+    offCurve: createBoundedKeySet(MAX_REPORTED_KEYS),
+    unknownQuotes: createBoundedKeySet(MAX_REPORTED_KEYS),
+  })
   return Object.freeze({
     name: JOB_NAME,
     async run(ctx: CrankContext): Promise<CrankJobResult> {
       try {
-        return await runClaims(ctx, guards, reportedOffCurve)
+        return await runClaims(ctx, guards, warned)
       } catch (err) {
         return toResult(withError(EMPTY_TALLY, `claims: ${errorMessage(err)}`))
       }

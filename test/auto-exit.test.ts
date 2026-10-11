@@ -24,6 +24,7 @@ import {
 } from '@solana/spl-token'
 import {
   DBC_PROGRAM_ID,
+  HAIRCUT_PER_EXIT,
   ROUTER_PROGRAM_ID,
   autoExitInstruction,
   decodeMarket,
@@ -39,7 +40,7 @@ import {
   type QuoteMintInfo,
 } from '@trucee/sdk'
 import { describe, expect, it, vi } from 'vitest'
-import { DEFAULT_MIN_ATA_VALUE_LAMPORTS, type CrankGuards } from '../src/config.js'
+import { DEFAULT_MIN_ATA_VALUE_LAMPORTS, defaultCrankGuards, quoteMinimums, type CrankGuards, type QuoteMinimums } from '../src/config.js'
 import type { CrankContext, CrankJobResult } from '../src/crank/index.js'
 import {
   CONFIRM_TIMEOUT_MS,
@@ -54,8 +55,8 @@ import {
 const cluster = getClusterConfig('localnet')
 const NOW = 1_800_000_000n
 const TOKENS = 5_000_000n
-const BASIS = 100_000_000n
-/** A basis whose refund is far below MIN_ATA_VALUE_LAMPORTS (0.05 SOL). */
+const BASIS = 1_000_000_000n
+/** A basis whose refund is far below MIN_ATA_VALUE_LAMPORTS (0.25 SOL). */
 const DUST_BASIS = 1_000_000n
 const FUNDED_LAMPORTS = 10_000_000_000
 /** No ATA rent guard: the CRK-05 tests are about exits; the CRK-10 tests pass their own guards. */
@@ -65,7 +66,10 @@ const OPEN_GUARDS: CrankGuards = Object.freeze({
   crankMinSolLamports: 0n,
   minMigrateThresholdSolLamports: 0n,
 })
-const NO_ATAS: AtaRule = Object.freeze({ ownerQuoteAtaExists: new Map<string, boolean>(), minAtaValueLamports: 0n })
+/** The same ATA minimum for every quote mint of the test cluster. */
+const minimumsOf = (ataValue: bigint): ReadonlyMap<string, QuoteMinimums> =>
+  new Map(cluster.quoteMints.map((quote) => [quote.mint.toBase58(), { ataValue, migrateThreshold: 0n }]))
+const NO_ATAS: AtaRule = Object.freeze({ ownerQuoteAtaExists: new Map<string, boolean>(), quoteMinimums: minimumsOf(0n) })
 const autoExitJob = createAutoExitJob(OPEN_GUARDS)
 const LIVE = 0
 /** DBC MigrationProgress: PostBondingCurve, LockedVesting, CreatedPool. */
@@ -292,9 +296,28 @@ describe('planAutoExits', () => {
   describe('owner quote ATA rent (CRK-10)', () => {
     const ataOf = (position: PositionAccount): string =>
       getAssociatedTokenAddressSync(SOL.mint, position.owner, false, SOL.tokenProgram).toBase58()
-    const rule = (minAtaValueLamports: bigint, existing: readonly PositionAccount[] = []): AtaRule => ({
+    const rule = (minAtaValue: bigint, existing: readonly PositionAccount[] = []): AtaRule => ({
       ownerQuoteAtaExists: new Map(existing.map((position) => [ataOf(position), true])),
-      minAtaValueLamports,
+      quoteMinimums: minimumsOf(minAtaValue),
+    })
+    /** feeNumerator 0, so refund = basis - HAIRCUT_PER_EXIT: the payout is set exactly. */
+    const payoutEntry = (quote: QuoteMintInfo, payout: bigint) => {
+      const market = makeMarket(quote, { feeNumerator: 0n })
+      return { market, position: makePosition(market, { basis: payout + HAIRCUT_PER_EXIT }) }
+    }
+
+    it.each([
+      ['wSOL, the 0.25 SOL default', SOL, 249_999_999n, 250_000_000n],
+      ['xStock, 0.1 share (raw units)', TSLAX, 9_000_000n, 10_000_000n],
+    ])('with the default minimums (%s), skips a missing ATA just below the minimum and creates it at the minimum', (_, quote, below, atMin) => {
+      const ata: AtaRule = { ownerQuoteAtaExists: new Map(), quoteMinimums: quoteMinimums(defaultCrankGuards('localnet'), cluster.quoteMints) }
+      const [skipped, created] = [below, atMin].map((payout) => payoutEntry(quote, payout))
+
+      expect(refundFor(created!.position.basis, 0n)).toBe(atMin)
+      expect(plan(scenario([skipped!]), payer, NOW, ata)).toEqual([])
+      expect(plan(scenario([created!]), payer, NOW, ata).map((tx) => tx.map(normalize))).toEqual([
+        expectedExit(created!.market, quote, created!.position.owner, payer).map(normalize),
+      ])
     })
 
     it('plans no instructions for a missing ATA whose refund is below MIN_ATA_VALUE_LAMPORTS', () => {
@@ -931,6 +954,20 @@ describe('autoExitJob ATA rent and payer guards (CRK-10)', () => {
     expect(log.warn).toHaveBeenCalledTimes(1)
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('off curve'), expect.objectContaining({ position: position.address.toBase58() }))
     expect(chain.fake.simulateTransaction).not.toHaveBeenCalled()
+  })
+
+  it('skips positions whose quote mint has no crank minimums and warns once per mint for the job instance', async () => {
+    const market = makeMarket(SOL, { quoteMint: randomKey() })
+    const chain = fakeConnection(chainOf([{ market, position: makePosition(market, { autoExitDeadline: CHAIN_NOW - 5n }) }]))
+    const log = fakeLog()
+    const job = createAutoExitJob(guards())
+
+    const first = await job.run(context(chain.connection, Keypair.generate(), 10, log))
+    const second = await job.run(context(chain.connection, Keypair.generate(), 10, log))
+
+    expect([first, second]).toEqual([{ sent: [], skipped: 1, errors: [] }, { sent: [], skipped: 1, errors: [] }])
+    expect(log.warn).toHaveBeenCalledTimes(1)
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('quote mint'), expect.objectContaining({ quoteMint: market.quoteMint.toBase58() }))
   })
 
   it('exits a real overdue position this tick even behind 50 dust positions with earlier deadlines', async () => {

@@ -71,8 +71,8 @@ const POSITION_MARKET_OFFSET = 40
 const FAKE_RPC_KEY = 'FAKE-RPC-KEY-0123456789'
 const RPC_URL_WITH_KEY = `https://rpc.example.invalid/v2/${FAKE_RPC_KEY}?api-key=${FAKE_RPC_KEY}`
 const FUNDED_LAMPORTS = 10_000_000_000
-/** Surplus 0.6 SOL over a 3_000 basis snapshot: a 1_000 basis position's share is 0.2 SOL, a 1 basis one's is dust. */
-const SURPLUS_SNAPSHOT = 600_000_000n
+/** Surplus 0.9 SOL over a 3_000 basis snapshot: a 1_000 basis position's share is 0.3 SOL, a 1 basis one's is dust. */
+const SURPLUS_SNAPSHOT = 900_000_000n
 const DUST_BASIS = 1n
 /** No ATA rent guard: the CRK-03 tests are about claims; the CRK-10 tests pass their own guards. */
 const OPEN_GUARDS: CrankGuards = Object.freeze({
@@ -296,7 +296,7 @@ describe('planClaims', () => {
       const share = (market.surplusSnapshot * position.basis) / market.basisSnapshot
       const planAt = (min: bigint) => planClaims(market, [position], new Map(), payer, TOKEN_PROGRAM_ID, CLUSTER, min)
 
-      expect(share).toBe(200_000_000n)
+      expect(share).toBe(300_000_000n)
       expect(planAt(share)[0]?.map((ix) => ix.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID))).toEqual([true, false])
       expect(planAt(share + 1n)).toEqual([[]])
     })
@@ -678,15 +678,17 @@ describe('claimsJob', () => {
     expect(result.errors[0]).toMatch(/sig-1/)
   })
 
-  it('records an error for a market whose quote mint is not in the cluster config', async () => {
+  it('skips a market whose quote mint has no crank minimums, warning once per mint for the job instance', async () => {
     const market = makeMarket({ quoteMint: Keypair.generate().publicKey })
     const fake = fakeConnection({ markets: [market], positions: [makePosition(market)] })
+    const log = silentLog()
 
-    const result = await claimsJob.run(makeContext(fake, 10))
+    const results = [await claimsJob.run(makeContext(fake, 10, log)), await claimsJob.run(makeContext(fake, 10, log))]
 
-    expect(result.sent).toEqual([])
-    expect(result.errors).toHaveLength(1)
-    expect(result.errors[0]).toMatch(/quote mint/)
+    expect(results).toEqual([{ sent: [], skipped: 0, errors: [] }, { sent: [], skipped: 0, errors: [] }])
+    expect(log.warn).toHaveBeenCalledTimes(1)
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('quote mint'), expect.objectContaining({ quoteMint: market.quoteMint.toBase58() }))
+    expect(fake.getProgramAccounts).toHaveBeenCalledTimes(2) // the market scans only: no position read
     expect(fake.sendTransaction).not.toHaveBeenCalled()
   })
 
@@ -885,6 +887,17 @@ describe('claimsJob ATA rent and payer guards (CRK-10)', () => {
     expect(result).toEqual({ sent: ['sig-1', 'sig-2'], skipped: 1, errors: [] })
     expect(sentTransactions(fake).filter(createsAta)).toHaveLength(2)
     expect(log.info).toHaveBeenCalledWith(expect.stringContaining('quote ATA missing'), expect.objectContaining({ belowMinValue: 0, overCreateCap: 1 }))
+  })
+
+  it('creates a missing xStock ATA for a 0.1 share surplus share, not for 0.09 share (raw-unit minimum)', async () => {
+    const market: MarketAccount = { ...makeMarket({ quoteMint: TSLAX_MINT }), surplusSnapshot: 1_000_000_000n, basisSnapshot: 1_000n }
+    const [small, enough] = [9n, 10n].map((basis) => makePosition(market, undefined, basis)) // shares 9e6 and 1e7 raw
+    const fake = fakeConnection({ markets: [market], positions: [small!, enough!] })
+
+    const result = await createClaimsJob(guards).run(makeContext(fake, 10))
+
+    expect(result).toEqual({ sent: ['sig-1'], skipped: 1, errors: [] })
+    expect(sentTransactions(fake).map(claimOwner)).toEqual([enough!.owner.toBase58()])
   })
 
   it('claims a dust share into an existing quote ATA without creating one', async () => {

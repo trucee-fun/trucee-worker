@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { Keypair } from '@solana/web3.js'
+import type { QuoteMintInfo, QuoteSymbol } from '@trucee/sdk'
 import { z } from 'zod'
 
 const CLUSTERS = ['devnet', 'mainnet-beta', 'localnet'] as const
@@ -17,8 +18,8 @@ export type WorkerCluster = (typeof CLUSTERS)[number]
  */
 export interface CrankGuards {
   /**
-   * A missing owner quote ATA is created only when the payout (auto-exit refund, surplus share) is at least this,
-   * in quote base units (lamports for SOL). Smaller payouts are left to the owner.
+   * wSOL quotes: a missing owner quote ATA is created only when the payout (auto-exit refund, surplus share) is at least
+   * this many lamports. Smaller payouts are left to the owner. Other quote mints use quoteMinimums.
    */
   readonly minAtaValueLamports: bigint
   /** Owner quote ATAs each job (auto-exit, claims) may create per tick. */
@@ -27,6 +28,14 @@ export interface CrankGuards {
   readonly crankMinSolLamports: bigint
   /** The migrate job skips wSOL pools whose DBC migration quote threshold is below this many lamports. */
   readonly minMigrateThresholdSolLamports: bigint
+}
+
+/** The crank minimums of one quote mint, in its raw units (lamports for wSOL, raw base units for xStocks). */
+export interface QuoteMinimums {
+  /** Least payout (auto-exit refund, surplus share) for which the crank creates a missing owner quote ATA. */
+  readonly ataValue: bigint
+  /** Least DBC migration quote threshold of a pool the crank migrates. */
+  readonly migrateThreshold: bigint
 }
 
 export interface WorkerConfig extends CrankGuards {
@@ -40,13 +49,19 @@ export interface WorkerConfig extends CrankGuards {
 const DEFAULT_CRANK_KEYPAIR = '~/.config/solana/id.json'
 const DEFAULT_CRANK_INTERVAL_MS = 15_000
 const DEFAULT_MAX_TX_PER_TICK = 10
-export const DEFAULT_MIN_ATA_VALUE_LAMPORTS = 50_000_000n
+/**
+ * 0.25 SOL. Farming the rent (~0.00204 SOL) of an ATA the crank creates costs an attacker about 2 x the ~1% router fee
+ * x the payout (buy, then exit at cost), so it pays only below a ~0.1 SOL payout; 0.25 SOL keeps a margin above that.
+ */
+export const DEFAULT_MIN_ATA_VALUE_LAMPORTS = 250_000_000n
 export const DEFAULT_MAX_ATA_CREATES_PER_TICK = 2
 export const DEFAULT_CRANK_MIN_SOL_LAMPORTS = 50_000_000n
 /** Mainnet-beta default of MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS (1 SOL); a migration costs the crank ~0.02 SOL. */
 const MAINNET_MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS = 1_000_000_000n
 /** Devnet and localnet migrate every wSOL pool, so small demo launches (0.303 SOL) still graduate. */
 const TEST_CLUSTER_MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS = 0n
+/** xStocks (8 decimals): an ATA for a payout of at least 0.1 share, a migration for a threshold of at least 1 share. */
+const XSTOCK_MINIMUMS: QuoteMinimums = Object.freeze({ ataValue: 10_000_000n, migrateThreshold: 100_000_000n })
 /** Floor on the tick interval so a typo cannot hammer the RPC provider. */
 const MIN_CRANK_INTERVAL_MS = 100
 /** solana-keygen files hold the 64-byte ed25519 secret key as a JSON array of numbers. */
@@ -113,6 +128,20 @@ export function defaultCrankGuards(cluster: WorkerCluster): CrankGuards {
     minMigrateThresholdSolLamports:
       cluster === 'mainnet-beta' ? MAINNET_MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS : TEST_CLUSTER_MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS,
   })
+}
+
+/**
+ * The crank minimums of each quote mint in `quoteMints` (the cluster's, from getClusterConfig), keyed by mint (base58).
+ * The wSOL row comes from the guards (MIN_ATA_VALUE_LAMPORTS, MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS); xStocks have fixed
+ * raw-unit minimums. A mint absent from the table is unknown: the crank creates no ATA and migrates no pool for it.
+ */
+export function quoteMinimums(guards: CrankGuards, quoteMints: readonly QuoteMintInfo[]): ReadonlyMap<string, QuoteMinimums> {
+  const wsol: QuoteMinimums = Object.freeze({
+    ataValue: guards.minAtaValueLamports,
+    migrateThreshold: guards.minMigrateThresholdSolLamports,
+  })
+  const bySymbol: Readonly<Record<QuoteSymbol, QuoteMinimums>> = { SOL: wsol, TSLAx: XSTOCK_MINIMUMS, NVDAx: XSTOCK_MINIMUMS }
+  return new Map(quoteMints.map((quote) => [quote.mint.toBase58(), bySymbol[quote.symbol]]))
 }
 
 const lamportsOr = (value: number | undefined, fallback: bigint): bigint => (value === undefined ? fallback : BigInt(value))

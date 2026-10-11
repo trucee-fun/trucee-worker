@@ -15,9 +15,10 @@
  * RPC_TIMEOUT_MS, a confirmation after CONFIRM_TIMEOUT_MS, and at most ctx.maxTx * MAX_ATTEMPTS_PER_TX pools are
  * attempted per tick.
  *
- * Guards (CRK-10): a migration costs the crank ~0.02 SOL, so it skips wSOL pools whose migration quote threshold is
- * below minMigrateThresholdSolLamports (anyone can still migrate them, e.g. at migrator.meteora.ag; non-SOL quotes have
- * no crank minimum), and plans nothing while the payer holds less than crankMinSolLamports.
+ * Guards (CRK-10): a migration costs the crank ~0.02 SOL, so it skips pools whose migration quote threshold is below
+ * their quote mint's minimum (quoteMinimums: wSOL from minMigrateThresholdSolLamports, xStocks 1 share) and pools of a
+ * quote mint without minimums; anyone can still migrate them, e.g. at migrator.meteora.ag. It plans nothing while the
+ * payer holds less than crankMinSolLamports.
  */
 import {
   PACKET_DATA_SIZE,
@@ -28,7 +29,6 @@ import {
   type Keypair,
   type PublicKey,
 } from '@solana/web3.js'
-import { NATIVE_MINT } from '@solana/spl-token'
 import {
   DAMM_V2_MIGRATION_FEE_ADDRESS,
   DynamicBondingCurveClient,
@@ -39,9 +39,10 @@ import {
   type TransferHookPool,
 } from '@meteora-ag/dynamic-bonding-curve-sdk'
 import { fetchAllMarkets } from '@trucee/sdk'
-import { defaultCrankGuards, type CrankGuards } from '../../config.js'
+import { defaultCrankGuards, quoteMinimums, type CrankGuards, type QuoteMinimums } from '../../config.js'
 import { errorMessage, redactUrls } from '../../log.js'
 import type { CrankContext, CrankJob, CrankJobResult } from '../index.js'
+import { MAX_REPORTED_KEYS, createBoundedKeySet, type BoundedKeySet } from './claims.js'
 
 const JOB_NAME = 'migrate'
 const COMMITMENT = 'confirmed'
@@ -95,9 +96,6 @@ export interface ConfigSnapshot {
   /** Quote the curve must collect to complete, in quote base units (lamports for wSOL). */
   readonly migrationQuoteThreshold: bigint
 }
-
-/** The guards this job applies (CRK-10); WorkerConfig satisfies it. */
-export type MigrateGuards = Pick<CrankGuards, 'crankMinSolLamports' | 'minMigrateThresholdSolLamports'>
 
 export type LoadResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: string }
 
@@ -583,30 +581,60 @@ async function payerAboveFloor(ctx: CrankContext, minLamports: bigint): Promise<
   return false
 }
 
-/** A wSOL pool whose threshold is below the crank minimum; non-SOL quotes have no crank minimum. */
-const belowSolMinimum = (target: MigrationTarget, minThresholdLamports: bigint): boolean =>
-  target.quoteMint.equals(NATIVE_MINT) && target.migrationQuoteThreshold < minThresholdLamports
+interface GatedTargets {
+  readonly ready: readonly MigrationTarget[]
+  /** Targets whose threshold is below their quote mint's crank minimum, with that minimum. */
+  readonly belowMinimum: readonly { readonly target: MigrationTarget; readonly minThreshold: bigint }[]
+  /** Targets whose quote mint has no crank minimums. */
+  readonly unknownQuote: readonly MigrationTarget[]
+}
 
-async function runMigrations(ctx: CrankContext, deps: MigrateJobDeps, configured: MigrateGuards | undefined): Promise<CrankJobResult> {
+/** Splits targets by their quote mint's minimum migration threshold. */
+function gateTargets(targets: readonly MigrationTarget[], minimums: ReadonlyMap<string, QuoteMinimums>): GatedTargets {
+  const checked = targets.map((target) => ({ target, min: minimums.get(target.quoteMint.toBase58())?.migrateThreshold }))
+  return {
+    ready: checked.flatMap(({ target, min }) => (min !== undefined && target.migrationQuoteThreshold >= min ? [target] : [])),
+    belowMinimum: checked.flatMap(({ target, min }) =>
+      min !== undefined && target.migrationQuoteThreshold < min ? [{ target, minThreshold: min }] : [],
+    ),
+    unknownQuote: checked.flatMap(({ target, min }) => (min === undefined ? [target] : [])),
+  }
+}
+
+/** Below-minimum pools are logged every tick (one line each); a quote mint without minimums once per job instance. */
+function logGated(ctx: CrankContext, gated: GatedTargets, reportedUnknownQuotes: BoundedKeySet): void {
+  for (const { target, minThreshold } of gated.belowMinimum) {
+    ctx.log.info('pool threshold below the crank minimum of its quote mint; not migrated by the crank', {
+      ...targetFields(target),
+      quoteMint: target.quoteMint.toBase58(),
+      migrationQuoteThreshold: target.migrationQuoteThreshold,
+      minThreshold,
+    })
+  }
+  for (const target of gated.unknownQuote) {
+    const quoteMint = target.quoteMint.toBase58()
+    if (!reportedUnknownQuotes.add(quoteMint)) continue
+    ctx.log.warn('quote mint has no crank minimums; its pools are not migrated by the crank', { ...targetFields(target), quoteMint })
+  }
+}
+
+async function runMigrations(
+  ctx: CrankContext,
+  deps: MigrateJobDeps,
+  configured: CrankGuards | undefined,
+  reportedUnknownQuotes: BoundedKeySet,
+): Promise<CrankJobResult> {
   const guards = configured ?? defaultCrankGuards(ctx.cluster.cluster)
   if (!(await payerAboveFloor(ctx, guards.crankMinSolLamports))) return { sent: [], skipped: 0, errors: [] }
   const loaded = await loadPools(ctx, deps)
   const configs = await loadConfigs(ctx, deps, loaded.pools.filter((pool) => needsMigration(pool.state)))
   const plan = planMigrations({ pools: loaded.pools, configs })
-  const minThresholdLamports = guards.minMigrateThresholdSolLamports
-  const tooSmall = plan.targets.filter((target) => belowSolMinimum(target, minThresholdLamports))
-  for (const target of tooSmall) {
-    ctx.log.info('wSOL pool below MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS; not migrated by the crank', {
-      ...targetFields(target),
-      migrationQuoteThreshold: target.migrationQuoteThreshold,
-      minThresholdLamports,
-    })
-  }
-  const targets = plan.targets.filter((target) => !belowSolMinimum(target, minThresholdLamports))
-  const tally = await executePlan(ctx, deps, targets)
+  const gated = gateTargets(plan.targets, quoteMinimums(guards, ctx.cluster.quoteMints))
+  logGated(ctx, gated, reportedUnknownQuotes)
+  const tally = await executePlan(ctx, deps, gated.ready)
   return {
     sent: [...tally.sent],
-    skipped: tally.skipped + loaded.mismatched + tooSmall.length,
+    skipped: tally.skipped + loaded.mismatched + gated.belowMinimum.length + gated.unknownQuote.length,
     errors: [...loaded.errors, ...plan.errors, ...tally.errors].map(redactUrls),
   }
 }
@@ -615,13 +643,14 @@ async function runMigrations(ctx: CrankContext, deps: MigrateJobDeps, configured
  * The migrate job with some chain access replaced (tests); every other dependency is the real one. Without `guards`
  * it uses defaultCrankGuards for ctx.cluster; the worker passes its WorkerConfig.
  */
-export function createMigrateJob(overrides: Partial<MigrateJobDeps> = {}, guards?: MigrateGuards): CrankJob {
+export function createMigrateJob(overrides: Partial<MigrateJobDeps> = {}, guards?: CrankGuards): CrankJob {
   const deps: MigrateJobDeps = Object.freeze({ ...DEFAULT_DEPS, ...overrides })
+  const reportedUnknownQuotes = createBoundedKeySet(MAX_REPORTED_KEYS)
   return Object.freeze({
     name: JOB_NAME,
     async run(ctx: CrankContext): Promise<CrankJobResult> {
       try {
-        return await runMigrations(ctx, deps, guards)
+        return await runMigrations(ctx, deps, guards, reportedUnknownQuotes)
       } catch (err) {
         const error = redactUrls(`migrate: ${errorMessage(err)}`)
         ctx.log.error('migrate job failed', { job: JOB_NAME, error })

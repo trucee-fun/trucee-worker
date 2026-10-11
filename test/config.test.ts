@@ -2,8 +2,9 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Connection, Keypair } from '@solana/web3.js'
+import { getClusterConfig } from '@trucee/sdk'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import { defaultCrankGuards, loadConfig, loadCrankKeypair, type WorkerConfig } from '../src/config.js'
+import { defaultCrankGuards, loadConfig, loadCrankKeypair, quoteMinimums, type WorkerConfig } from '../src/config.js'
 import { startCrank, type CrankContext, type CrankJob } from '../src/crank/index.js'
 import { log, registerSecret } from '../src/log.js'
 
@@ -97,7 +98,7 @@ describe('loadConfig', () => {
       crankKeypairPath: join(homedir(), '.config', 'solana', 'id.json'),
       crankIntervalMs: 15000,
       maxTxPerTick: 10,
-      minAtaValueLamports: 50_000_000n,
+      minAtaValueLamports: 250_000_000n,
       maxAtaCreatesPerTick: 2,
       crankMinSolLamports: 50_000_000n,
       minMigrateThresholdSolLamports: 0n,
@@ -139,11 +140,25 @@ describe('loadConfig', () => {
     expect(loadConfig({ ...base, CLUSTER: 'devnet' }).minMigrateThresholdSolLamports).toBe(0n)
     expect(loadConfig({ ...base, CLUSTER: 'localnet' }).minMigrateThresholdSolLamports).toBe(0n)
     expect(defaultCrankGuards('mainnet-beta')).toEqual({
-      minAtaValueLamports: 50_000_000n,
+      minAtaValueLamports: 250_000_000n,
       maxAtaCreatesPerTick: 2,
       crankMinSolLamports: 50_000_000n,
       minMigrateThresholdSolLamports: 1_000_000_000n,
     })
+  })
+
+  it('builds per-quote-mint minimums: the wSOL row from the guards, xStocks fixed in raw units, no other mint', () => {
+    const mainnetQuotes = getClusterConfig('mainnet-beta').quoteMints
+    const mainnet = quoteMinimums({ ...defaultCrankGuards('mainnet-beta'), minAtaValueLamports: 7n }, mainnetQuotes)
+    const devnet = quoteMinimums(defaultCrankGuards('devnet'), getClusterConfig('devnet').quoteMints)
+
+    expect(Object.fromEntries(mainnetQuotes.map((quote) => [quote.symbol, mainnet.get(quote.mint.toBase58())]))).toEqual({
+      SOL: { ataValue: 7n, migrateThreshold: 1_000_000_000n },
+      TSLAx: { ataValue: 10_000_000n, migrateThreshold: 100_000_000n },
+      NVDAx: { ataValue: 10_000_000n, migrateThreshold: 100_000_000n },
+    })
+    expect(mainnet.size).toBe(3)
+    expect([...devnet.values()]).toEqual([{ ataValue: 250_000_000n, migrateThreshold: 0n }])
   })
 
   it.each(['MIN_ATA_VALUE_LAMPORTS', 'MAX_ATA_CREATES_PER_TICK', 'CRANK_MIN_SOL_LAMPORTS', 'MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS'])(

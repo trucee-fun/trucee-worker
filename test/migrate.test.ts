@@ -59,6 +59,7 @@ const MARKET_CONFIG_OFFSET = 40
 const FUNDED_LAMPORTS = 10_000_000_000
 /** The devnet demo launch's migration quote threshold (0.303 SOL). */
 const DEMO_THRESHOLD_LAMPORTS = 303_000_000n
+const TSLAX_MINT = CLUSTER.quoteMints.find((quote) => quote.symbol === 'TSLAx')!.mint
 
 const { LOCKED_VESTING, CREATED_POOL, PRE_BONDING_CURVE, POST_BONDING_CURVE } = MIGRATION_PROGRESS
 
@@ -100,7 +101,7 @@ const ok = <T>(value: T): LoadResult<T> => ({ ok: true, value })
 const failed = <T>(error: string): LoadResult<T> => ({ ok: false, error })
 
 function configSnapshot(migrationFeeOption: number, overrides: Partial<ConfigSnapshot> = {}): ConfigSnapshot {
-  return { quoteMint: newKey(), migrationFeeOption, migrationQuoteThreshold: 0n, ...overrides }
+  return { quoteMint: NATIVE_MINT, migrationFeeOption, migrationQuoteThreshold: 0n, ...overrides }
 }
 
 /** A migrate_damm_v2 stand-in whose instruction needs the payer and both position-NFT mints as signers. */
@@ -700,17 +701,17 @@ describe('migrate job run', () => {
   })
 
   describe('crank guards (CRK-10)', () => {
-    /** One ready pool per quote mint, each with the 0.303 SOL demo threshold. */
-    function demoPools(quoteMints: readonly PublicKey[]) {
-      const pools = quoteMints.map(() => poolSnapshot(LOCKED_VESTING, false))
-      const snapshots = quoteMints.map((quoteMint) => configSnapshot(0, { quoteMint, migrationQuoteThreshold: DEMO_THRESHOLD_LAMPORTS }))
+    /** One ready pool per [quote mint, migration quote threshold]. */
+    function demoPools(rows: readonly (readonly [PublicKey, bigint])[]) {
+      const pools = rows.map(() => poolSnapshot(LOCKED_VESTING, false))
+      const snapshots = rows.map(([quoteMint, migrationQuoteThreshold]) => configSnapshot(0, { quoteMint, migrationQuoteThreshold }))
       const configs = new Map(pools.map((pool, i) => [pool.config.toBase58(), snapshots[i]!]))
       const buildMigration = vi.fn(async (ctx: CrankContext, _target: MigrationTarget) => fakeMigration(ctx.payer.publicKey))
       return { pools, deps: stubDeps(pools, { configs, overrides: { buildMigration } }), buildMigration }
     }
 
     it('migrates the 0.303 SOL demo threshold under the devnet default MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS (0)', async () => {
-      const { deps } = demoPools([NATIVE_MINT])
+      const { deps } = demoPools([[NATIVE_MINT, DEMO_THRESHOLD_LAMPORTS]])
       const connection = new Connection(LOCAL_RPC_URL)
       mockSendPath(connection)
 
@@ -719,24 +720,38 @@ describe('migrate job run', () => {
       expect(result).toEqual({ sent: [SIGNATURE], skipped: 0, errors: [] })
     })
 
-    it('skips, with one log line, a wSOL pool below the mainnet-beta minimum (1 SOL); a non-SOL quote has none', async () => {
-      const { pools, deps, buildMigration } = demoPools([NATIVE_MINT, newKey()])
+    it('skips, one log line each, pools below their quote minimum (wSOL 1 SOL on mainnet-beta, xStock 1 share)', async () => {
+      const rows = [[NATIVE_MINT, DEMO_THRESHOLD_LAMPORTS], [TSLAX_MINT, 90_000_000n], [TSLAX_MINT, 100_000_000n]] as const
+      const { pools, deps, buildMigration } = demoPools(rows)
       const connection = new Connection(LOCAL_RPC_URL)
       mockSendPath(connection)
       const { logger, lines } = recordingLogger()
 
       const result = await createMigrateJob(deps, defaultCrankGuards('mainnet-beta')).run(testContext({ connection, logger }))
 
-      expect(result).toEqual({ sent: [SIGNATURE], skipped: 1, errors: [] })
-      expect(buildMigration.mock.calls.map(([, target]) => target.pool.toBase58())).toEqual([pools[1]!.pool.toBase58()])
-      const skippedLines = lines.filter((line) => line.ctx.pool === pools[0]!.pool.toBase58())
-      expect(skippedLines).toHaveLength(1)
-      expect(skippedLines[0]?.ctx).toMatchObject({ migrationQuoteThreshold: DEMO_THRESHOLD_LAMPORTS, minThresholdLamports: 1_000_000_000n })
+      expect(result).toEqual({ sent: [SIGNATURE], skipped: 2, errors: [] })
+      expect(buildMigration.mock.calls.map(([, target]) => target.pool.toBase58())).toEqual([pools[2]!.pool.toBase58()])
+      const linesOf = (i: number) => lines.filter((line) => line.ctx.pool === pools[i]!.pool.toBase58())
+      expect(linesOf(0).map((line) => line.ctx)).toEqual([expect.objectContaining({ migrationQuoteThreshold: DEMO_THRESHOLD_LAMPORTS, minThreshold: 1_000_000_000n })])
+      expect(linesOf(1).map((line) => line.ctx)).toEqual([expect.objectContaining({ migrationQuoteThreshold: 90_000_000n, minThreshold: 100_000_000n })])
+    })
+
+    it('skips a pool whose quote mint has no crank minimums, warning once per mint for the job instance', async () => {
+      const unknownMint = newKey()
+      const { deps, buildMigration } = demoPools([[unknownMint, 10_000_000_000n]])
+      const { logger, lines } = recordingLogger()
+      const job = createMigrateJob(deps, defaultCrankGuards('mainnet-beta'))
+
+      const results = [await job.run(testContext({ logger })), await job.run(testContext({ logger }))]
+
+      expect(results).toEqual([{ sent: [], skipped: 1, errors: [] }, { sent: [], skipped: 1, errors: [] }])
+      expect(buildMigration).not.toHaveBeenCalled()
+      expect(lines.map((line) => [line.level, line.ctx.quoteMint])).toEqual([['warn', unknownMint.toBase58()]])
     })
 
     it('sends no migration while the payer holds less than CRANK_MIN_SOL_LAMPORTS, with one log line', async () => {
       vi.spyOn(Connection.prototype, 'getBalance').mockResolvedValue(49_999_999)
-      const { deps, buildMigration } = demoPools([NATIVE_MINT])
+      const { deps, buildMigration } = demoPools([[NATIVE_MINT, DEMO_THRESHOLD_LAMPORTS]])
       const listMarkets = vi.fn(deps.listMarkets)
       const { logger, lines } = recordingLogger()
 
@@ -838,7 +853,7 @@ describe('migrate job default loaders (decoded DBC accounts)', () => {
     const poolB = newKey()
     const configA = newKey()
     const configB = newKey()
-    const quoteMint = newKey()
+    const quoteMint = NATIVE_MINT
     const connection = new Connection(LOCAL_RPC_URL)
     const accounts = new Map([
       [poolA.toBase58(), await encodePool(configA, newKey(), LOCKED_VESTING, 0)],
