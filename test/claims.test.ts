@@ -7,12 +7,12 @@ import {
   Keypair,
   PublicKey,
   SystemProgram,
+  TransactionInstruction,
   TransactionMessage,
   type AccountInfo,
   type Connection,
   type GetProgramAccountsConfig,
   type GetProgramAccountsFilter,
-  type TransactionInstruction,
   type VersionedTransaction,
 } from '@solana/web3.js'
 import {
@@ -24,17 +24,29 @@ import {
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token'
 import {
+  claimSurplusInstruction,
   findBufferPda,
   findMarketPda,
   findPositionPda,
   getClusterConfig,
+  type ClaimParams,
   type ClusterConfig,
   type MarketAccount,
   type PositionAccount,
 } from '@trucee/sdk'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { CrankContext } from '../src/crank/index.js'
-import { claimsJob, planClaims } from '../src/crank/jobs/claims.js'
+import { CONFIRM_TIMEOUT_MS, RPC_TIMEOUT_MS, claimsJob, planClaims } from '../src/crank/jobs/claims.js'
+
+// Only claimSurplusInstruction is wrapped (still the real builder) so one test can make it pay the wrong account.
+vi.mock('@trucee/sdk', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@trucee/sdk')>()
+  return { ...actual, claimSurplusInstruction: vi.fn(actual.claimSurplusInstruction) }
+})
+
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 const CLUSTER: ClusterConfig = getClusterConfig('localnet')
 const ROUTER = CLUSTER.routerProgramId
@@ -47,7 +59,6 @@ const MARKET_SIZE = 274
 const POSITION_SIZE = 97
 const PUBKEY_SIZE = 32
 const POSITION_MARKET_OFFSET = 40
-const CONFIRM_TIMEOUT_MS = 45_000
 const FAKE_RPC_KEY = 'FAKE-RPC-KEY-0123456789'
 const RPC_URL_WITH_KEY = `https://rpc.example.invalid/v2/${FAKE_RPC_KEY}?api-key=${FAKE_RPC_KEY}`
 
@@ -115,6 +126,16 @@ function keyAt(ix: TransactionInstruction | undefined, index: number): string | 
 function isClaim(ix: TransactionInstruction | undefined): boolean {
   if (ix === undefined || !ix.programId.equals(ROUTER)) return false
   return [...ix.data.subarray(0, 8)].join() === CLAIM_SURPLUS_DISCRIMINATOR.join()
+}
+
+/** A claim_surplus builder that pays `thief` instead of the owner's canonical quote ATA. */
+async function tamperedClaimBuilder(thief: PublicKey): Promise<(params: ClaimParams) => TransactionInstruction> {
+  const actual = await vi.importActual<typeof import('@trucee/sdk')>('@trucee/sdk')
+  return (params) => {
+    const ix = actual.claimSurplusInstruction(params)
+    const keys = ix.keys.map((meta, i) => (i === CLAIM_KEY.ownerQuote ? { ...meta, pubkey: thief } : meta))
+    return new TransactionInstruction({ programId: ix.programId, keys, data: ix.data })
+  }
 }
 
 /* ---------- planClaims ---------- */
@@ -220,6 +241,14 @@ describe('planClaims', () => {
     )
   })
 
+  it('fails closed when the claim builder would pay anything but the owner canonical quote ATA', async () => {
+    const market = makeMarket()
+    const position = makePosition(market)
+    vi.mocked(claimSurplusInstruction).mockImplementationOnce(await tamperedClaimBuilder(Keypair.generate().publicKey))
+
+    expect(() => planClaims(market, [position], new Map(), payer, TOKEN_PROGRAM_ID)).toThrow(/canonical quote ATA/)
+  })
+
   it('does not mutate its inputs', () => {
     const market = makeMarket()
     const positions = Object.freeze([makePosition(market), makePosition(market)])
@@ -272,8 +301,12 @@ interface FakeChainOptions {
   readonly positions?: readonly PositionAccount[]
   /** Quote ATAs that already exist on chain. */
   readonly existingAtas?: readonly PublicKey[]
-  /** ATA addresses that only hold lamports someone sent there (a system-owned account, not a token account). */
-  readonly prefundedAtas?: readonly PublicKey[]
+  /** Accounts at ATA addresses owned by some other program, as [ata, owner]: not live token accounts. */
+  readonly foreignAtas?: readonly (readonly [PublicKey, PublicKey])[]
+  /** One RPC read that never answers. */
+  readonly hangs?: HangingCall
+  /** Owners whose claim send never answers. */
+  readonly sendHangsFor?: readonly PublicKey[]
   /** Owners whose claim simulation fails. */
   readonly simulationFailsFor?: readonly PublicKey[]
   /** Owners whose claim send throws. */
@@ -281,6 +314,10 @@ interface FakeChainOptions {
   /** Owners whose claim lands but fails on chain. */
   readonly landsFailedFor?: readonly PublicKey[]
 }
+
+type HangingCall = 'markets' | 'positions' | 'getMultipleAccountsInfo' | 'getLatestBlockhash' | 'simulateTransaction'
+
+const NEVER = new Promise<never>(() => undefined)
 
 interface Memcmp {
   readonly bytes: string
@@ -308,7 +345,7 @@ function claimOwner(tx: VersionedTransaction): string | undefined {
 function fakeConnection(options: FakeChainOptions) {
   const positions = options.positions ?? []
   const existing = new Set((options.existingAtas ?? []).map((key) => key.toBase58()))
-  const prefunded = new Set((options.prefundedAtas ?? []).map((key) => key.toBase58()))
+  const foreign = new Map((options.foreignAtas ?? []).map(([ata, owner]) => [ata.toBase58(), owner]))
   let sendCount = 0
   const ownerIn = (list: readonly PublicKey[] | undefined, owner: string | undefined): boolean =>
     (list ?? []).some((key) => key.toBase58() === owner)
@@ -319,25 +356,30 @@ function fakeConnection(options: FakeChainOptions) {
     const filters = config?.filters ?? []
     const discriminator = discriminatorOf(filters)
     if (discriminator === MARKET_DISCRIMINATOR.join()) {
+      if (options.hangs === 'markets') return NEVER
       return options.markets.map((m) => ({ pubkey: m.address, account: accountInfo(encodeMarket(m), ROUTER) }))
     }
     if (discriminator !== POSITION_DISCRIMINATOR.join()) throw new Error('unexpected getProgramAccounts filters')
+    if (options.hangs === 'positions') return NEVER
     const market = memcmpAt(filters, POSITION_MARKET_OFFSET)?.bytes
     return positions
       .filter((p) => p.market.toBase58() === market)
       .map((p) => ({ pubkey: p.address, account: accountInfo(encodePosition(p), ROUTER) }))
   })
-  const getMultipleAccountsInfo = vi.fn(async (keys: PublicKey[]) =>
-    keys.map((key) => {
+  const getMultipleAccountsInfo = vi.fn(async (keys: PublicKey[]) => {
+    if (options.hangs === 'getMultipleAccountsInfo') return NEVER
+    return keys.map((key) => {
       if (existing.has(key.toBase58())) return accountInfo(Buffer.alloc(165), TOKEN_PROGRAM_ID)
-      return prefunded.has(key.toBase58()) ? accountInfo(Buffer.alloc(0), SystemProgram.programId) : null
-    }),
-  )
-  const getLatestBlockhash = vi.fn(async () => ({
-    blockhash: Keypair.generate().publicKey.toBase58(),
-    lastValidBlockHeight: 1_000,
-  }))
+      const owner = foreign.get(key.toBase58())
+      return owner === undefined ? null : accountInfo(Buffer.alloc(165), owner)
+    })
+  })
+  const getLatestBlockhash = vi.fn(async () => {
+    if (options.hangs === 'getLatestBlockhash') return NEVER
+    return { blockhash: Keypair.generate().publicKey.toBase58(), lastValidBlockHeight: 1_000 }
+  })
   const simulateTransaction = vi.fn(async (tx: VersionedTransaction) => {
+    if (options.hangs === 'simulateTransaction') return NEVER
     const fails = ownerIn(options.simulationFailsFor, claimOwner(tx))
     return {
       context: { slot: 1 },
@@ -349,6 +391,7 @@ function fakeConnection(options: FakeChainOptions) {
   const sendTransaction = vi.fn(async (tx: VersionedTransaction) => {
     const owner = claimOwner(tx)
     if (ownerIn(options.sendFailsFor, owner)) throw new Error('send failed')
+    if (ownerIn(options.sendHangsFor, owner)) return NEVER
     sendCount += 1
     const signature = `sig-${sendCount}`
     signatureOwners.set(signature, owner)
@@ -465,11 +508,15 @@ describe('claimsJob', () => {
     expect(keyAt(claim, CLAIM_KEY.ownerQuote)).toBe(ata.toBase58())
   })
 
-  it('still creates the quote ATA when its address only holds lamports sent there', async () => {
+  it.each([
+    ['the system program (lamports sent to the address)', SystemProgram.programId],
+    ['Token-2022 under an SPL Token quote', TOKEN_2022_PROGRAM_ID],
+    ['an unrelated program', Keypair.generate().publicKey],
+  ])('treats an account at the quote ATA address owned by %s as missing', async (_, owner) => {
     const market = makeMarket()
     const position = makePosition(market)
     const ata = quoteAtaOf(market, position.owner)
-    const fake = fakeConnection({ markets: [market], positions: [position], prefundedAtas: [ata] })
+    const fake = fakeConnection({ markets: [market], positions: [position], foreignAtas: [[ata, owner]] })
 
     const result = await claimsJob.run(makeContext(fake, 10))
 
@@ -583,57 +630,144 @@ describe('claimsJob', () => {
     expect(fake.sendTransaction).not.toHaveBeenCalled()
   })
 
-  it('records an error instead of throwing when the RPC fails', async () => {
-    const fake = fakeConnection({ markets: [] })
-    fake.getProgramAccounts.mockRejectedValueOnce(new Error('rpc unavailable'))
+  it('gives up on a confirmation after 45 s, reports the outcome as unknown and does not resend', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const market = makeMarket()
+    const position = makePosition(market)
+    const fake = fakeConnection({ markets: [market], positions: [position] })
+    fake.confirmTransaction.mockReturnValueOnce(NEVER)
+    const log = silentLog()
+
+    const run = claimsJob.run(makeContext(fake, 10, log))
+    await vi.advanceTimersByTimeAsync(CONFIRM_TIMEOUT_MS)
+    const result = await run
+
+    expect(result.sent).toEqual([])
+    expect(result.errors).toEqual([expect.stringMatching(/sig-1 not confirmed within 45000 ms; outcome unknown/)])
+    expect(fake.sendTransaction).toHaveBeenCalledTimes(1)
+    expect(log.warn).toHaveBeenCalledWith(
+      'claims: outcome unknown; not resent this tick',
+      expect.objectContaining({ signature: 'sig-1', owner: position.owner.toBase58() }),
+    )
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('caps attempts per tick at 3 x maxTx when every simulation fails', async () => {
+    const market = makeMarket()
+    const positions = Array.from({ length: 5 }, () => makePosition(market))
+    const fake = fakeConnection({ markets: [market], positions, simulationFailsFor: positions.map((p) => p.owner) })
+
+    const result = await claimsJob.run(makeContext(fake, 1))
+
+    expect(fake.simulateTransaction).toHaveBeenCalledTimes(3)
+    expect(fake.sendTransaction).not.toHaveBeenCalled()
+    expect(result).toEqual({ sent: [], skipped: 5, errors: [] })
+  })
+
+  it('stops reading markets once it has planned as many claims as it may attempt', async () => {
+    const [first, second] = [makeMarket(), makeMarket()]
+    const positions = [...Array.from({ length: 3 }, () => makePosition(first)), makePosition(second)]
+    const fake = fakeConnection({ markets: [first, second], positions })
+
+    const result = await claimsJob.run(makeContext(fake, 1))
+
+    expect(fake.getProgramAccounts).toHaveBeenCalledTimes(2)
+    expect(result).toEqual({ sent: ['sig-1'], skipped: 2, errors: [] })
+  })
+
+  it('fetches one blockhash per tick and signs every claim with it', async () => {
+    const [first, second] = [makeMarket(), makeMarket()]
+    const positions = [makePosition(first), makePosition(first), makePosition(second), makePosition(second)]
+    const fake = fakeConnection({ markets: [first, second], positions })
 
     const result = await claimsJob.run(makeContext(fake, 10))
 
-    expect(result).toEqual({ sent: [], skipped: 0, errors: [expect.stringMatching(/rpc unavailable/)] })
+    expect(result.sent).toHaveLength(4)
+    expect(fake.getLatestBlockhash).toHaveBeenCalledTimes(1)
+    expect(new Set(sentTransactions(fake).map((tx) => tx.message.recentBlockhash)).size).toBe(1)
   })
 
-  it('gives up on a confirmation after 45 s, reports the outcome as unknown and does not resend', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    try {
-      const market = makeMarket()
-      const position = makePosition(market)
-      const fake = fakeConnection({ markets: [market], positions: [position] })
-      let markConfirming: () => void = () => undefined
-      const confirming = new Promise<void>((resolve) => {
-        markConfirming = resolve
-      })
-      fake.confirmTransaction.mockImplementationOnce(() => {
-        markConfirming()
-        return new Promise<never>(() => undefined)
-      })
-      const log = silentLog()
+  it('fetches no blockhash when there is nothing to claim', async () => {
+    const fake = fakeConnection({ markets: [makeMarket()] })
 
-      const run = claimsJob.run(makeContext(fake, 10, log))
-      await confirming
-      await vi.advanceTimersByTimeAsync(CONFIRM_TIMEOUT_MS)
+    await claimsJob.run(makeContext(fake, 10))
+
+    expect(fake.getLatestBlockhash).not.toHaveBeenCalled()
+  })
+
+  it.each(['markets', 'positions', 'getMultipleAccountsInfo', 'getLatestBlockhash', 'simulateTransaction'] as const)(
+    'records an error and sends nothing when %s does not answer within 30 s',
+    async (hangs) => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+      const market = makeMarket()
+      const fake = fakeConnection({ markets: [market], positions: [makePosition(market)], hangs })
+
+      const run = claimsJob.run(makeContext(fake, 10))
+      await vi.advanceTimersByTimeAsync(RPC_TIMEOUT_MS)
       const result = await run
 
       expect(result.sent).toEqual([])
-      expect(result.errors).toEqual([expect.stringMatching(/sig-1 not confirmed within 45000 ms; outcome unknown/)])
-      expect(fake.sendTransaction).toHaveBeenCalledTimes(1)
-      expect(log.warn).toHaveBeenCalledWith(
-        'claims: confirmation timed out; outcome unknown',
-        expect.objectContaining({ signature: 'sig-1', owner: position.owner.toBase58() }),
-      )
-    } finally {
-      vi.useRealTimers()
-    }
+      expect(result.errors).toEqual([expect.stringMatching(/not answered within 30000 ms/)])
+      expect(fake.sendTransaction).not.toHaveBeenCalled()
+      expect(vi.getTimerCount()).toBe(0)
+    },
+  )
+
+  it('treats a send that does not answer within 30 s as an unknown outcome and does not resend it', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const market = makeMarket()
+    const [stuck, fine] = [makePosition(market), makePosition(market)]
+    const fake = fakeConnection({ markets: [market], positions: [stuck, fine], sendHangsFor: [stuck.owner] })
+    const log = silentLog()
+
+    const run = claimsJob.run(makeContext(fake, 10, log))
+    await vi.advanceTimersByTimeAsync(RPC_TIMEOUT_MS)
+    const result = await run
+
+    expect(result.sent).toHaveLength(1)
+    expect(result.errors).toEqual([expect.stringMatching(/send not answered within 30000 ms; outcome unknown/)])
+    expect(sentTransactions(fake).map(claimOwner)).toEqual([stuck.owner.toBase58(), fine.owner.toBase58()])
+    expect(log.warn).toHaveBeenCalledWith(
+      'claims: outcome unknown; not resent this tick',
+      expect.objectContaining({ owner: stuck.owner.toBase58(), signature: null }),
+    )
+    expect(vi.getTimerCount()).toBe(0)
   })
 
-  it('keeps the RPC URL and its key out of result.errors when the market read fails', async () => {
+  it('records an error and sends nothing when the claim builder would pay the wrong account', async () => {
+    const market = makeMarket()
+    const fake = fakeConnection({ markets: [market], positions: [makePosition(market)] })
+    vi.mocked(claimSurplusInstruction).mockImplementationOnce(await tamperedClaimBuilder(Keypair.generate().publicKey))
+
+    const result = await claimsJob.run(makeContext(fake, 10))
+
+    expect(result.sent).toEqual([])
+    expect(result.errors).toEqual([expect.stringMatching(/canonical quote ATA/)])
+    expect(fake.simulateTransaction).not.toHaveBeenCalled()
+    expect(fake.sendTransaction).not.toHaveBeenCalled()
+  })
+
+  it('warns about an off-curve owner once, but skips it every tick', async () => {
+    const market = makeMarket()
+    const offCurve = makePosition(market, offCurveOwner())
+    const fake = fakeConnection({ markets: [market], positions: [offCurve] })
+    const log = silentLog()
+
+    const first = await claimsJob.run(makeContext(fake, 10, log))
+    const second = await claimsJob.run(makeContext(fake, 10, log))
+
+    expect([first.skipped, second.skipped]).toEqual([1, 1])
+    expect(log.warn).toHaveBeenCalledTimes(1)
+  })
+
+  it('records an error without the RPC URL or its key, instead of throwing, when the market read fails', async () => {
     const fake = fakeConnection({ markets: [] })
     fake.getProgramAccounts.mockRejectedValueOnce(new Error(`request to ${RPC_URL_WITH_KEY} failed`))
 
     const result = await claimsJob.run(makeContext(fake, 10))
 
-    expect(result.errors).toHaveLength(1)
+    expect(result).toEqual({ sent: [], skipped: 0, errors: [expect.stringMatching(/to rpc\.example\.invalid failed/)] })
     expect(result.errors.join('\n')).not.toContain(FAKE_RPC_KEY)
-    expect(result.errors[0]).toMatch(/rpc\.example\.invalid/)
   })
 
   it('keeps the RPC URL and its key out of result.errors when a send fails', async () => {
