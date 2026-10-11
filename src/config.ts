@@ -8,24 +8,67 @@ import { join } from 'node:path'
 import { Keypair } from '@solana/web3.js'
 import { z } from 'zod'
 
-export interface WorkerConfig {
-  cluster: 'devnet' | 'mainnet-beta' | 'localnet'
+const CLUSTERS = ['devnet', 'mainnet-beta', 'localnet'] as const
+export type WorkerCluster = (typeof CLUSTERS)[number]
+
+/**
+ * Spending guards of the crank jobs (CRK-10). The crank pays the rent (~0.002 SOL) of every owner quote ATA it creates,
+ * and an owner can close that ATA and keep the rent, so ATA creation is capped by value and per tick.
+ */
+export interface CrankGuards {
+  /**
+   * A missing owner quote ATA is created only when the payout (auto-exit refund, surplus share) is at least this,
+   * in quote base units (lamports for SOL). Smaller payouts are left to the owner.
+   */
+  readonly minAtaValueLamports: bigint
+  /** Owner quote ATAs each job (auto-exit, claims) may create per tick. */
+  readonly maxAtaCreatesPerTick: number
+  /** A job plans nothing while the crank payer holds fewer lamports than this. */
+  readonly crankMinSolLamports: bigint
+  /** The migrate job skips wSOL pools whose DBC migration quote threshold is below this many lamports. */
+  readonly minMigrateThresholdSolLamports: bigint
+}
+
+export interface WorkerConfig extends CrankGuards {
+  cluster: WorkerCluster
   rpcUrl: string
   crankKeypairPath: string
   crankIntervalMs: number
   maxTxPerTick: number
 }
 
-const CLUSTERS = ['devnet', 'mainnet-beta', 'localnet'] as const
 const DEFAULT_CRANK_KEYPAIR = '~/.config/solana/id.json'
 const DEFAULT_CRANK_INTERVAL_MS = 15_000
 const DEFAULT_MAX_TX_PER_TICK = 10
+export const DEFAULT_MIN_ATA_VALUE_LAMPORTS = 50_000_000n
+export const DEFAULT_MAX_ATA_CREATES_PER_TICK = 2
+export const DEFAULT_CRANK_MIN_SOL_LAMPORTS = 50_000_000n
+/** Mainnet-beta default of MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS (1 SOL); a migration costs the crank ~0.02 SOL. */
+const MAINNET_MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS = 1_000_000_000n
+/** Devnet and localnet migrate every wSOL pool, so small demo launches (0.303 SOL) still graduate. */
+const TEST_CLUSTER_MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS = 0n
 /** Floor on the tick interval so a typo cannot hammer the RPC provider. */
 const MIN_CRANK_INTERVAL_MS = 100
 /** solana-keygen files hold the 64-byte ed25519 secret key as a JSON array of numbers. */
 const SECRET_KEY_BYTES = 64
 
-const ENV_KEYS = ['CLUSTER', 'RPC_URL', 'CRANK_KEYPAIR', 'CRANK_INTERVAL_MS', 'MAX_TX_PER_TICK'] as const
+const ENV_KEYS = [
+  'CLUSTER',
+  'RPC_URL',
+  'CRANK_KEYPAIR',
+  'CRANK_INTERVAL_MS',
+  'MAX_TX_PER_TICK',
+  'MIN_ATA_VALUE_LAMPORTS',
+  'MAX_ATA_CREATES_PER_TICK',
+  'CRANK_MIN_SOL_LAMPORTS',
+  'MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS',
+] as const
+
+const NON_NEGATIVE_INTEGER = 'must be a non-negative integer'
+
+/** A non-negative safe integer; unset means the cluster default, applied by loadConfig. */
+const nonNegativeInteger = () =>
+  z.coerce.number({ error: NON_NEGATIVE_INTEGER }).int(NON_NEGATIVE_INTEGER).min(0, NON_NEGATIVE_INTEGER).optional()
 
 const envSchema = z.object({
   CLUSTER: z.enum(CLUSTERS, {
@@ -47,7 +90,24 @@ const envSchema = z.object({
     .int('must be a positive integer')
     .positive('must be a positive integer')
     .default(DEFAULT_MAX_TX_PER_TICK),
+  MIN_ATA_VALUE_LAMPORTS: nonNegativeInteger(),
+  MAX_ATA_CREATES_PER_TICK: nonNegativeInteger(),
+  CRANK_MIN_SOL_LAMPORTS: nonNegativeInteger(),
+  MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS: nonNegativeInteger(),
 })
+
+/** The guards a job uses when it is created without explicit ones; only the migrate minimum depends on the cluster. */
+export function defaultCrankGuards(cluster: WorkerCluster): CrankGuards {
+  return Object.freeze({
+    minAtaValueLamports: DEFAULT_MIN_ATA_VALUE_LAMPORTS,
+    maxAtaCreatesPerTick: DEFAULT_MAX_ATA_CREATES_PER_TICK,
+    crankMinSolLamports: DEFAULT_CRANK_MIN_SOL_LAMPORTS,
+    minMigrateThresholdSolLamports:
+      cluster === 'mainnet-beta' ? MAINNET_MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS : TEST_CLUSTER_MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS,
+  })
+}
+
+const lamportsOr = (value: number | undefined, fallback: bigint): bigint => (value === undefined ? fallback : BigInt(value))
 
 /** Expands a leading `~` to the user's home directory. */
 export function expandHome(path: string): string {
@@ -72,12 +132,17 @@ export function loadConfig(env: NodeJS.ProcessEnv): WorkerConfig {
     throw new Error(scrub(`Invalid worker config: ${problems}`, env.RPC_URL))
   }
   const data = parsed.data
+  const defaults = defaultCrankGuards(data.CLUSTER)
   return Object.freeze({
     cluster: data.CLUSTER,
     rpcUrl: data.RPC_URL,
     crankKeypairPath: expandHome(data.CRANK_KEYPAIR),
     crankIntervalMs: data.CRANK_INTERVAL_MS,
     maxTxPerTick: data.MAX_TX_PER_TICK,
+    minAtaValueLamports: lamportsOr(data.MIN_ATA_VALUE_LAMPORTS, defaults.minAtaValueLamports),
+    maxAtaCreatesPerTick: data.MAX_ATA_CREATES_PER_TICK ?? defaults.maxAtaCreatesPerTick,
+    crankMinSolLamports: lamportsOr(data.CRANK_MIN_SOL_LAMPORTS, defaults.crankMinSolLamports),
+    minMigrateThresholdSolLamports: lamportsOr(data.MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS, defaults.minMigrateThresholdSolLamports),
   })
 }
 

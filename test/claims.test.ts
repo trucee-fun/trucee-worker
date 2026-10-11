@@ -10,6 +10,7 @@ import {
   TransactionInstruction,
   TransactionMessage,
   type AccountInfo,
+  type Commitment,
   type Connection,
   type GetProgramAccountsConfig,
   type GetProgramAccountsFilter,
@@ -35,8 +36,15 @@ import {
   type PositionAccount,
 } from '@trucee/sdk'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { DEFAULT_MIN_ATA_VALUE_LAMPORTS, type CrankGuards } from '../src/config.js'
 import type { CrankContext } from '../src/crank/index.js'
-import { CONFIRM_TIMEOUT_MS, RPC_TIMEOUT_MS, claimsJob, planClaims } from '../src/crank/jobs/claims.js'
+import {
+  CONFIRM_TIMEOUT_MS,
+  RPC_TIMEOUT_MS,
+  claimsJob as defaultClaimsJob,
+  createClaimsJob,
+  planClaims,
+} from '../src/crank/jobs/claims.js'
 
 // Only claimSurplusInstruction is wrapped (still the real builder) so one test can make it pay the wrong account.
 vi.mock('@trucee/sdk', async (importOriginal) => {
@@ -61,6 +69,18 @@ const PUBKEY_SIZE = 32
 const POSITION_MARKET_OFFSET = 40
 const FAKE_RPC_KEY = 'FAKE-RPC-KEY-0123456789'
 const RPC_URL_WITH_KEY = `https://rpc.example.invalid/v2/${FAKE_RPC_KEY}?api-key=${FAKE_RPC_KEY}`
+const FUNDED_LAMPORTS = 10_000_000_000
+/** Surplus 0.6 SOL over a 3_000 basis snapshot: a 1_000 basis position's share is 0.2 SOL, a 1 basis one's is dust. */
+const SURPLUS_SNAPSHOT = 600_000_000n
+const DUST_BASIS = 1n
+/** No ATA rent guard: the CRK-03 tests are about claims; the CRK-10 tests pass their own guards. */
+const OPEN_GUARDS: CrankGuards = Object.freeze({
+  minAtaValueLamports: 0n,
+  maxAtaCreatesPerTick: Number.MAX_SAFE_INTEGER,
+  crankMinSolLamports: 0n,
+  minMigrateThresholdSolLamports: 0n,
+})
+const claimsJob = createClaimsJob(OPEN_GUARDS)
 
 /** claim_surplus account order: cranker, owner, market, position, owner_quote, buffer_vault, quote_mint, token program. */
 const CLAIM_KEY = Object.freeze({ cranker: 0, owner: 1, market: 2, position: 3, ownerQuote: 4 })
@@ -88,19 +108,19 @@ function makeMarket({ finalized = true, quoteMint = NATIVE_MINT }: MarketOptions
     bump: 254,
     totalBasis: 3_000n,
     finalized,
-    surplusSnapshot: finalized ? 600n : 0n,
+    surplusSnapshot: finalized ? SURPLUS_SNAPSHOT : 0n,
     basisSnapshot: finalized ? 3_000n : 0n,
     surplusClaimed: 0n,
   })
 }
 
-function makePosition(market: MarketAccount, owner: PublicKey = Keypair.generate().publicKey): PositionAccount {
+function makePosition(market: MarketAccount, owner: PublicKey = Keypair.generate().publicKey, basis = 1_000n): PositionAccount {
   return Object.freeze({
     address: findPositionPda(market.address, owner, ROUTER),
     owner,
     market: market.address,
     tokens: 1_000_000n,
-    basis: 1_000n,
+    basis,
     bump: 253,
     autoExitDeadline: null,
   })
@@ -259,6 +279,39 @@ describe('planClaims', () => {
     expect(exists.size).toBe(1)
     expect(positions).toHaveLength(2)
   })
+
+  describe('owner quote ATA rent (CRK-10)', () => {
+    it('plans no instructions for a missing ATA whose surplus share is below MIN_ATA_VALUE_LAMPORTS', () => {
+      const market = makeMarket()
+
+      const plan = planClaims(market, [makePosition(market, undefined, DUST_BASIS)], new Map(), payer, TOKEN_PROGRAM_ID)
+
+      expect(plan).toEqual([[]])
+    })
+
+    it('creates a missing ATA once floor(surplus_snapshot * basis / basis_snapshot) reaches MIN_ATA_VALUE_LAMPORTS', () => {
+      const market = makeMarket()
+      const position = makePosition(market)
+      const share = (market.surplusSnapshot * position.basis) / market.basisSnapshot
+      const planAt = (min: bigint) => planClaims(market, [position], new Map(), payer, TOKEN_PROGRAM_ID, CLUSTER, min)
+
+      expect(share).toBe(200_000_000n)
+      expect(planAt(share)[0]?.map((ix) => ix.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID))).toEqual([true, false])
+      expect(planAt(share + 1n)).toEqual([[]])
+    })
+
+    it('claims a dust share with no ATA create when the quote ATA exists (no threshold)', () => {
+      const market = makeMarket()
+      const position = makePosition(market, undefined, DUST_BASIS)
+      const exists = ataExistence([[quoteAtaOf(market, position.owner), true]])
+
+      const plan = planClaims(market, [position], exists, payer, TOKEN_PROGRAM_ID)
+
+      expect(plan).toHaveLength(1)
+      expect(plan[0]).toHaveLength(1)
+      expect(isClaim(plan[0]?.[0])).toBe(true)
+    })
+  })
 })
 
 /* ---------- raw account encoding for the fake RPC ---------- */
@@ -313,9 +366,11 @@ interface FakeChainOptions {
   readonly sendFailsFor?: readonly PublicKey[]
   /** Owners whose claim lands but fails on chain. */
   readonly landsFailedFor?: readonly PublicKey[]
+  /** The crank payer's lamports; FUNDED_LAMPORTS when absent. */
+  readonly payerBalance?: number
 }
 
-type HangingCall = 'markets' | 'positions' | 'getMultipleAccountsInfo' | 'getLatestBlockhash' | 'simulateTransaction'
+type HangingCall = 'getBalance' | 'markets' | 'positions' | 'getMultipleAccountsInfo' | 'getLatestBlockhash' | 'simulateTransaction'
 
 const NEVER = new Promise<never>(() => undefined)
 
@@ -366,6 +421,9 @@ function fakeConnection(options: FakeChainOptions) {
       .filter((p) => p.market.toBase58() === market)
       .map((p) => ({ pubkey: p.address, account: accountInfo(encodePosition(p), ROUTER) }))
   })
+  const getBalance = vi.fn(async (_key: PublicKey, _commitment?: Commitment) =>
+    options.hangs === 'getBalance' ? NEVER : (options.payerBalance ?? FUNDED_LAMPORTS),
+  )
   const getMultipleAccountsInfo = vi.fn(async (keys: PublicKey[]) => {
     if (options.hangs === 'getMultipleAccountsInfo') return NEVER
     return keys.map((key) => {
@@ -405,6 +463,7 @@ function fakeConnection(options: FakeChainOptions) {
   }))
 
   const methods = {
+    getBalance,
     getProgramAccounts,
     getMultipleAccountsInfo,
     getLatestBlockhash,
@@ -695,7 +754,7 @@ describe('claimsJob', () => {
     expect(fake.getLatestBlockhash).not.toHaveBeenCalled()
   })
 
-  it.each(['markets', 'positions', 'getMultipleAccountsInfo', 'getLatestBlockhash', 'simulateTransaction'] as const)(
+  it.each(['getBalance', 'markets', 'positions', 'getMultipleAccountsInfo', 'getLatestBlockhash', 'simulateTransaction'] as const)(
     'records an error and sends nothing when %s does not answer within 30 s',
     async (hangs) => {
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
@@ -796,5 +855,76 @@ describe('claimsJob', () => {
     const result = await claimsJob.run(ctx)
 
     expect(result).toEqual({ sent: [], skipped: 0, errors: [expect.stringMatching(/unknown cluster/)] })
+  })
+})
+
+describe('claimsJob ATA rent and payer guards (CRK-10)', () => {
+  const guards: CrankGuards = { ...OPEN_GUARDS, minAtaValueLamports: DEFAULT_MIN_ATA_VALUE_LAMPORTS, maxAtaCreatesPerTick: 2 }
+  const createsAta = (tx: VersionedTransaction): boolean =>
+    instructionsOf(tx).some((ix) => ix.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID))
+
+  it('creates at most MAX_ATA_CREATES_PER_TICK missing ATAs per tick and logs the rest once', async () => {
+    const market = makeMarket()
+    const fake = fakeConnection({ markets: [market], positions: [makePosition(market), makePosition(market), makePosition(market)] })
+    const log = silentLog()
+
+    const result = await createClaimsJob(guards).run(makeContext(fake, 10, log))
+
+    expect(result).toEqual({ sent: ['sig-1', 'sig-2'], skipped: 1, errors: [] })
+    expect(sentTransactions(fake).filter(createsAta)).toHaveLength(2)
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining('quote ATA missing'), expect.objectContaining({ belowMinValue: 0, overCreateCap: 1 }))
+  })
+
+  it('claims a dust share into an existing quote ATA without creating one', async () => {
+    const market = makeMarket()
+    const position = makePosition(market, undefined, DUST_BASIS)
+    const fake = fakeConnection({ markets: [market], positions: [position], existingAtas: [quoteAtaOf(market, position.owner)] })
+
+    const result = await createClaimsJob(guards).run(makeContext(fake, 10))
+
+    expect(result.sent).toEqual(['sig-1'])
+    expect(sentTransactions(fake).filter(createsAta)).toEqual([])
+  })
+
+  it('claims a real share this tick even behind 50 dust positions with missing ATAs', async () => {
+    const market = makeMarket()
+    const dust = Array.from({ length: 50 }, () => makePosition(market, undefined, DUST_BASIS))
+    const real = makePosition(market)
+    const fake = fakeConnection({ markets: [market], positions: [...dust, real] })
+
+    const result = await createClaimsJob(guards).run(makeContext(fake, 1))
+
+    expect(result).toEqual({ sent: ['sig-1'], skipped: 50, errors: [] })
+    expect(fake.simulateTransaction).toHaveBeenCalledTimes(1)
+    expect(sentTransactions(fake).map(claimOwner)).toEqual([real.owner.toBase58()])
+  })
+
+  it('keeps reading markets past claims that the create cap will skip, so they do not starve later markets', async () => {
+    const [first, second] = [makeMarket(), makeMarket()]
+    const later = makePosition(second)
+    const positions = [...Array.from({ length: 6 }, () => makePosition(first)), later]
+    const fake = fakeConnection({ markets: [first, second], positions, existingAtas: [quoteAtaOf(second, later.owner)] })
+
+    const result = await createClaimsJob({ ...guards, maxAtaCreatesPerTick: 1 }).run(makeContext(fake, 2))
+
+    expect(result).toEqual({ sent: ['sig-1', 'sig-2'], skipped: 5, errors: [] })
+    expect(sentTransactions(fake).map(claimOwner)).toContain(later.owner.toBase58())
+  })
+
+  it('logs once and plans nothing while the payer holds less than CRANK_MIN_SOL_LAMPORTS (default 0.05 SOL)', async () => {
+    const market = makeMarket()
+    const [below, atFloor] = [49_999_999, 50_000_000].map((payerBalance) =>
+      fakeConnection({ markets: [market], positions: [makePosition(market)], payerBalance }),
+    )
+    const log = silentLog()
+
+    const skipped = await defaultClaimsJob.run(makeContext(below!, 10, log))
+    const ran = await defaultClaimsJob.run(makeContext(atFloor!, 10))
+
+    expect(skipped).toEqual({ sent: [], skipped: 0, errors: [] })
+    expect(below!.getBalance).toHaveBeenCalledWith(payerKeypair.publicKey, 'confirmed')
+    expect(below!.getProgramAccounts).not.toHaveBeenCalled()
+    expect([log.info, log.warn, log.error].map((fn) => fn.mock.calls.length)).toEqual([0, 1, 0])
+    expect(ran.sent).toEqual(['sig-1'])
   })
 })

@@ -14,6 +14,10 @@
  * Bounds: the tick runner has no timeout of its own, so every RPC call (and building a migration) gives up after
  * RPC_TIMEOUT_MS, a confirmation after CONFIRM_TIMEOUT_MS, and at most ctx.maxTx * MAX_ATTEMPTS_PER_TX pools are
  * attempted per tick.
+ *
+ * Guards (CRK-10): a migration costs the crank ~0.02 SOL, so it skips wSOL pools whose migration quote threshold is
+ * below minMigrateThresholdSolLamports (anyone can still migrate them, e.g. at migrator.meteora.ag; non-SOL quotes have
+ * no crank minimum), and plans nothing while the payer holds less than crankMinSolLamports.
  */
 import {
   PACKET_DATA_SIZE,
@@ -24,6 +28,7 @@ import {
   type Keypair,
   type PublicKey,
 } from '@solana/web3.js'
+import { NATIVE_MINT } from '@solana/spl-token'
 import {
   DAMM_V2_MIGRATION_FEE_ADDRESS,
   DynamicBondingCurveClient,
@@ -34,6 +39,7 @@ import {
   type TransferHookPool,
 } from '@meteora-ag/dynamic-bonding-curve-sdk'
 import { fetchAllMarkets } from '@trucee/sdk'
+import { defaultCrankGuards, type CrankGuards } from '../../config.js'
 import { errorMessage, redactUrls } from '../../log.js'
 import type { CrankContext, CrankJob, CrankJobResult } from '../index.js'
 
@@ -86,7 +92,12 @@ export interface PoolSnapshot {
 export interface ConfigSnapshot {
   readonly quoteMint: PublicKey
   readonly migrationFeeOption: number
+  /** Quote the curve must collect to complete, in quote base units (lamports for wSOL). */
+  readonly migrationQuoteThreshold: bigint
 }
+
+/** The guards this job applies (CRK-10); WorkerConfig satisfies it. */
+export type MigrateGuards = Pick<CrankGuards, 'crankMinSolLamports' | 'minMigrateThresholdSolLamports'>
 
 export type LoadResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: string }
 
@@ -103,6 +114,8 @@ export interface MigrationTarget {
   readonly dammConfig: PublicKey
   /** The DAMM v2 pool the migration creates. */
   readonly dammPool: PublicKey
+  /** The pool's DBC config migration quote threshold, in quote base units. */
+  readonly migrationQuoteThreshold: bigint
 }
 
 export interface MigrationPlan {
@@ -172,7 +185,7 @@ function planPool(pool: PoolSnapshot, configs: MigrationPlanInput['configs']): L
   const config = configs.get(configKey)
   if (config === undefined) return fail(`config ${configKey} was not loaded`)
   if (!config.ok) return fail(`config ${configKey}: ${config.error}`)
-  const { quoteMint, migrationFeeOption } = config.value
+  const { quoteMint, migrationFeeOption, migrationQuoteThreshold } = config.value
   const dammConfig = dammConfigFor(migrationFeeOption)
   if (dammConfig === null) return fail(`config ${configKey}: migration fee option ${migrationFeeOption} has no DAMM v2 config`)
   return ok(
@@ -182,6 +195,7 @@ function planPool(pool: PoolSnapshot, configs: MigrationPlanInput['configs']): L
       quoteMint,
       dammConfig,
       dammPool: deriveDammV2PoolAddress(dammConfig, pool.baseMint, quoteMint),
+      migrationQuoteThreshold,
     }),
   )
 }
@@ -263,7 +277,11 @@ const toPoolSnapshot = (pool: PublicKey, account: TransferHookPool): PoolSnapsho
   })
 
 const toConfigSnapshot = (_config: PublicKey, account: ConfigWithTransferHook): ConfigSnapshot =>
-  Object.freeze({ quoteMint: account.config.quoteMint, migrationFeeOption: account.config.migrationFeeOption })
+  Object.freeze({
+    quoteMint: account.config.quoteMint,
+    migrationFeeOption: account.config.migrationFeeOption,
+    migrationQuoteThreshold: BigInt(account.config.migrationQuoteThreshold.toString()),
+  })
 
 async function buildDammV2Migration(ctx: CrankContext, target: MigrationTarget): Promise<MigrateToDammV2Response> {
   const client = new DynamicBondingCurveClient(ctx.connection, COMMITMENT)
@@ -556,26 +574,54 @@ async function loadConfigs(
   return new Map(unique.map((config, i) => [config.toBase58(), results[i] ?? fail<ConfigSnapshot>('config was not returned')]))
 }
 
-async function runMigrations(ctx: CrankContext, deps: MigrateJobDeps): Promise<CrankJobResult> {
+/** True when the payer holds at least `minLamports`; otherwise logs once and the job plans nothing this tick. */
+async function payerAboveFloor(ctx: CrankContext, minLamports: bigint): Promise<boolean> {
+  const balance = BigInt(await bounded('getBalance', ctx.connection.getBalance(ctx.payer.publicKey, COMMITMENT)))
+  if (balance >= minLamports) return true
+  const fields = { job: JOB_NAME, payer: ctx.payer.publicKey.toBase58(), balanceLamports: balance, minLamports }
+  ctx.log.warn('migrate: crank payer balance below CRANK_MIN_SOL_LAMPORTS; nothing planned this tick', fields)
+  return false
+}
+
+/** A wSOL pool whose threshold is below the crank minimum; non-SOL quotes have no crank minimum. */
+const belowSolMinimum = (target: MigrationTarget, minThresholdLamports: bigint): boolean =>
+  target.quoteMint.equals(NATIVE_MINT) && target.migrationQuoteThreshold < minThresholdLamports
+
+async function runMigrations(ctx: CrankContext, deps: MigrateJobDeps, configured: MigrateGuards | undefined): Promise<CrankJobResult> {
+  const guards = configured ?? defaultCrankGuards(ctx.cluster.cluster)
+  if (!(await payerAboveFloor(ctx, guards.crankMinSolLamports))) return { sent: [], skipped: 0, errors: [] }
   const loaded = await loadPools(ctx, deps)
   const configs = await loadConfigs(ctx, deps, loaded.pools.filter((pool) => needsMigration(pool.state)))
   const plan = planMigrations({ pools: loaded.pools, configs })
-  const tally = await executePlan(ctx, deps, plan.targets)
+  const minThresholdLamports = guards.minMigrateThresholdSolLamports
+  const tooSmall = plan.targets.filter((target) => belowSolMinimum(target, minThresholdLamports))
+  for (const target of tooSmall) {
+    ctx.log.info('wSOL pool below MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS; not migrated by the crank', {
+      ...targetFields(target),
+      migrationQuoteThreshold: target.migrationQuoteThreshold,
+      minThresholdLamports,
+    })
+  }
+  const targets = plan.targets.filter((target) => !belowSolMinimum(target, minThresholdLamports))
+  const tally = await executePlan(ctx, deps, targets)
   return {
     sent: [...tally.sent],
-    skipped: tally.skipped + loaded.mismatched,
+    skipped: tally.skipped + loaded.mismatched + tooSmall.length,
     errors: [...loaded.errors, ...plan.errors, ...tally.errors].map(redactUrls),
   }
 }
 
-/** The migrate job with some chain access replaced (tests); every other dependency is the real one. */
-export function createMigrateJob(overrides: Partial<MigrateJobDeps> = {}): CrankJob {
+/**
+ * The migrate job with some chain access replaced (tests); every other dependency is the real one. Without `guards`
+ * it uses defaultCrankGuards for ctx.cluster; the worker passes its WorkerConfig.
+ */
+export function createMigrateJob(overrides: Partial<MigrateJobDeps> = {}, guards?: MigrateGuards): CrankJob {
   const deps: MigrateJobDeps = Object.freeze({ ...DEFAULT_DEPS, ...overrides })
   return Object.freeze({
     name: JOB_NAME,
     async run(ctx: CrankContext): Promise<CrankJobResult> {
       try {
-        return await runMigrations(ctx, deps)
+        return await runMigrations(ctx, deps, guards)
       } catch (err) {
         const error = redactUrls(`migrate: ${errorMessage(err)}`)
         ctx.log.error('migrate job failed', { job: JOB_NAME, error })

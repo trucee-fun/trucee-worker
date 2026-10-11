@@ -3,12 +3,19 @@
  * (router `auto_exit`, ONC-12). The router compares the deadline with Clock.unix_timestamp, so "now" comes from the
  * Clock sysvar, never from the local wall clock.
  *
- * planAutoExits is pure: one transaction per due position, the most overdue first, each
- * [create the owner's canonical quote ATA (idempotent, paid by the crank), auto_exit].
- * autoExitJob.run fetches the state, plans, then simulates each transaction and sends at most ctx.maxTx of them.
+ * planAutoExits is pure: one transaction per due position, the most overdue first. It is [auto_exit] when the owner's
+ * canonical quote ATA exists, else [create that ATA (idempotent, paid by the crank), auto_exit].
+ *
+ * ATA rent guard (CRK-10): an owner can close the ATA the crank paid for and keep its rent, so a missing ATA is created
+ * only when the refund is at least minAtaValueLamports, and at most maxAtaCreatesPerTick ATAs are created per tick.
+ * Any other exit with a missing ATA is skipped (left to the owner) without using the tick's budget. While the payer
+ * holds less than crankMinSolLamports, the job plans nothing.
+ *
+ * The job fetches the state, plans, then simulates each transaction and sends at most ctx.maxTx of them.
  * Every RPC call is bounded in wall-clock time, because the tick runner has no tick-level timeout.
  */
 import {
+  PublicKey,
   SYSVAR_CLOCK_PUBKEY,
   TransactionMessage,
   VersionedTransaction,
@@ -16,7 +23,6 @@ import {
   type BlockhashWithExpiryBlockHeight,
   type GetProgramAccountsFilter,
   type Keypair,
-  type PublicKey,
   type TransactionError,
   type TransactionInstruction,
 } from '@solana/web3.js'
@@ -28,11 +34,13 @@ import {
   decodeTxError,
   getClusterConfig,
   marketAccountsFor,
+  refundFor,
   type ClusterConfig,
   type DecodedTxError,
   type MarketAccount,
   type PositionAccount,
 } from '@trucee/sdk'
+import { defaultCrankGuards, type CrankGuards } from '../../config.js'
 import { errorMessage, redactUrls } from '../../log.js'
 import type { CrankContext, CrankJob, CrankJobResult } from '../index.js'
 
@@ -82,9 +90,36 @@ const POSITION_FILTER: GetProgramAccountsFilter = Object.freeze({
   memcmp: { offset: 0, bytes: Buffer.from(POSITION_DISCRIMINATOR).toString('base64'), encoding: 'base64' },
 })
 
+/** The guards this job applies (CRK-10); WorkerConfig satisfies it. */
+export type AutoExitGuards = Pick<CrankGuards, 'minAtaValueLamports' | 'maxAtaCreatesPerTick' | 'crankMinSolLamports'>
+
+/** What the planner knows about owners' quote ATAs. */
+export interface AtaRule {
+  /** Canonical owner quote ATA (base58) to whether it is a live token account; an absent ATA counts as missing. */
+  readonly ownerQuoteAtaExists: ReadonlyMap<string, boolean>
+  /** A missing ATA is created (rent paid by the crank) only when refundFor(basis, fee) is at least this. */
+  readonly minAtaValueLamports: bigint
+}
+
 interface PlannedExit {
   readonly position: PositionAccount
   readonly instructions: TransactionInstruction[]
+  /** The transaction creates the owner's quote ATA, its rent paid by the crank. */
+  readonly createsAta: boolean
+}
+
+interface ExitPlan {
+  readonly exits: readonly PlannedExit[]
+  /** Due exits skipped because the owner's quote ATA is missing and the refund is below minAtaValueLamports. */
+  readonly belowMinValue: number
+}
+
+/** A due position on a live curve, with what its exit needs. */
+interface ExitTarget {
+  readonly position: PositionAccount
+  readonly market: MarketAccount
+  readonly quoteTokenProgram: PublicKey
+  readonly ownerQuote: PublicKey
 }
 
 /* ---------- planner (pure) ---------- */
@@ -109,33 +144,36 @@ function byDeadline(a: PositionAccount, b: PositionAccount): number {
   return order !== 0 ? order : compare(a.address.toBase58(), b.address.toBase58())
 }
 
-function exitInstructions(
-  position: PositionAccount,
-  market: MarketAccount,
-  quoteTokenProgram: PublicKey,
-  payer: PublicKey,
-): TransactionInstruction[] {
-  const owner = position.owner
-  const ownerQuote = getAssociatedTokenAddressSync(market.quoteMint, owner, false, quoteTokenProgram)
-  return [
-    createAssociatedTokenAccountIdempotentInstruction(payer, ownerQuote, owner, market.quoteMint, quoteTokenProgram),
-    autoExitInstruction({ cluster: PLAN_CLUSTER, accounts: marketAccountsFor(market, quoteTokenProgram), cranker: payer, owner }),
-  ]
-}
-
-/** Null unless the market is known and not finalized, and its curve is known to be live. */
-function planExit(
+/**
+ * Null unless the market is known and not finalized, its curve is known to be live, its quote mint is allowed, and the
+ * owner is on the ed25519 curve (an off-curve owner has no canonical ATA).
+ */
+function exitTarget(
   position: PositionAccount,
   markets: ReadonlyMap<string, MarketAccount>,
   poolProgress: ReadonlyMap<string, number>,
-  payer: PublicKey,
-): PlannedExit | null {
+): ExitTarget | null {
   const market = markets.get(position.market.toBase58())
   if (market === undefined || market.finalized) return null
   if (poolProgress.get(market.pool.toBase58()) !== CURVE_LIVE) return null
   const quoteTokenProgram = QUOTE_TOKEN_PROGRAMS.get(market.quoteMint.toBase58())
-  if (quoteTokenProgram === undefined) return null
-  return { position, instructions: exitInstructions(position, market, quoteTokenProgram, payer) }
+  if (quoteTokenProgram === undefined || !PublicKey.isOnCurve(position.owner.toBytes())) return null
+  const ownerQuote = getAssociatedTokenAddressSync(market.quoteMint, position.owner, false, quoteTokenProgram)
+  return { position, market, quoteTokenProgram, ownerQuote }
+}
+
+const BELOW_MIN_VALUE = Symbol('below min value')
+
+/** The exit of `target`, or BELOW_MIN_VALUE when its ATA is missing and the refund cannot justify the rent. */
+function planTarget(target: ExitTarget, ata: AtaRule, payer: PublicKey): PlannedExit | typeof BELOW_MIN_VALUE {
+  const { position, market, quoteTokenProgram, ownerQuote } = target
+  const owner = position.owner
+  const accounts = marketAccountsFor(market, quoteTokenProgram)
+  const exit = autoExitInstruction({ cluster: PLAN_CLUSTER, accounts, cranker: payer, owner })
+  if (ata.ownerQuoteAtaExists.get(ownerQuote.toBase58()) === true) return { position, instructions: [exit], createsAta: false }
+  if (refundFor(position.basis, market.feeNumerator) < ata.minAtaValueLamports) return BELOW_MIN_VALUE
+  const createAta = createAssociatedTokenAccountIdempotentInstruction(payer, ownerQuote, owner, market.quoteMint, quoteTokenProgram)
+  return { position, instructions: [createAta, exit], createsAta: true }
 }
 
 function planExits(
@@ -144,20 +182,28 @@ function planExits(
   poolProgress: ReadonlyMap<string, number>,
   nowUnix: bigint,
   payer: PublicKey,
-): PlannedExit[] {
-  return positions
+  ata: AtaRule,
+): ExitPlan {
+  const planned = positions
     .filter((position) => isDue(position, nowUnix))
     .sort(byDeadline)
-    .map((position) => planExit(position, markets, poolProgress, payer))
-    .filter((exit): exit is PlannedExit => exit !== null)
+    .map((position) => exitTarget(position, markets, poolProgress))
+    .filter((target): target is ExitTarget => target !== null)
+    .map((target) => planTarget(target, ata, payer))
+  return {
+    exits: planned.filter((exit): exit is PlannedExit => exit !== BELOW_MIN_VALUE),
+    belowMinValue: planned.filter((exit) => exit === BELOW_MIN_VALUE).length,
+  }
 }
 
 /**
- * One transaction per position to auto-exit now, the most overdue first.
+ * One transaction per position to auto-exit now, the most overdue first. A position whose quote ATA is missing and
+ * whose refund is below `ata.minAtaValueLamports` gets none. The per-tick ATA create cap is applied when sending.
  * @param markets decoded router markets by market address (base58)
  * @param poolProgress DBC pool migration progress byte (@308) by pool address (base58)
  * @param nowUnix the chain clock (Clock.unix_timestamp)
  * @param payer the crank: signs auto_exit and pays for the owner's quote ATA if it does not exist
+ * @param ata which owner quote ATAs exist, and the least refund for which the crank creates a missing one
  */
 export function planAutoExits(
   positions: PositionAccount[],
@@ -165,8 +211,9 @@ export function planAutoExits(
   poolProgress: Map<string, number>,
   nowUnix: bigint,
   payer: PublicKey,
+  ata: AtaRule,
 ): TransactionInstruction[][] {
-  return planExits(positions, markets, poolProgress, nowUnix, payer).map((exit) => exit.instructions)
+  return planExits(positions, markets, poolProgress, nowUnix, payer, ata).exits.map((exit) => exit.instructions)
 }
 
 /* ---------- bounded RPC ---------- */
@@ -282,6 +329,29 @@ async function fetchMarkets(
     value: new Map(decoded.flatMap(({ market }) => (market === null ? [] : [[market.address.toBase58(), market] as const]))),
     errors: decoded.flatMap(({ error }) => (error === null ? [] : [error])),
   }
+}
+
+/**
+ * Canonical quote ATA (base58) of each target to whether it is a live token account. Anyone can send lamports to an
+ * ATA address before it exists, so only an account owned by the quote token program counts.
+ */
+async function fetchAtaExistence(ctx: CrankContext, targets: readonly ExitTarget[]): Promise<Map<string, boolean>> {
+  const infos = await fetchAccounts(ctx, uniqueKeys(targets.map((target) => target.ownerQuote)))
+  return new Map(
+    targets.map(({ ownerQuote, quoteTokenProgram }) => {
+      const ata = ownerQuote.toBase58()
+      return [ata, infos.get(ata)?.owner.equals(quoteTokenProgram) === true] as const
+    }),
+  )
+}
+
+/** True when the payer holds at least `minLamports`; otherwise logs once and the job plans nothing this tick. */
+async function payerAboveFloor(ctx: CrankContext, minLamports: bigint): Promise<boolean> {
+  const balance = BigInt(await rpc('getBalance', ctx.connection.getBalance(ctx.payer.publicKey, COMMITMENT)))
+  if (balance >= minLamports) return true
+  const fields = { job: JOB_NAME, payer: ctx.payer.publicKey, balanceLamports: balance, minLamports }
+  ctx.log.warn('auto-exit: crank payer balance below CRANK_MIN_SOL_LAMPORTS; nothing planned this tick', fields)
+  return false
 }
 
 /** Migration progress of each market's pool, read only from accounts the DBC program owns. */
@@ -448,43 +518,84 @@ function mayContinue(ctx: CrankContext, outcomes: readonly Outcome[]): boolean {
   )
 }
 
+interface Executed {
+  readonly result: CrankJobResult
+  /** Exits not tried because maxAtaCreates ATAs were already created this tick. */
+  readonly overCreateCap: number
+}
+
+/** A fresh result per call, so no caller can alias another call's arrays. */
+const emptyResult = (): CrankJobResult => ({ sent: [], skipped: 0, errors: [] })
+
 /**
  * Tries the exits in order with one blockhash per tick, until maxTx transactions went out, maxTx * 3 exits were
- * tried, or an RPC call timed out. Exits not tried count as skipped.
+ * tried, or an RPC call timed out. An exit that would create an ATA is not tried once maxAtaCreates transactions that
+ * create one went out (or may have). Exits not tried count as skipped.
  */
-async function executeExits(ctx: CrankContext, exits: readonly PlannedExit[]): Promise<CrankJobResult> {
-  if (exits.length === 0) return { sent: [], skipped: 0, errors: [] }
+async function executeExits(ctx: CrankContext, exits: readonly PlannedExit[], maxAtaCreates: number): Promise<Executed> {
+  if (exits.length === 0) return { result: emptyResult(), overCreateCap: 0 }
   let blockhash: BlockhashWithExpiryBlockHeight
   try {
     blockhash = await latestBlockhash(ctx)
   } catch (err) {
-    return { sent: [], skipped: exits.length, errors: [`${JOB_NAME}: ${errorMessage(err)}`] }
+    return { result: { sent: [], skipped: exits.length, errors: [`${JOB_NAME}: ${errorMessage(err)}`] }, overCreateCap: 0 }
   }
   let outcomes: readonly Outcome[] = []
+  let atasCreated = 0
+  let overCreateCap = 0
   for (const exit of exits) {
     if (!mayContinue(ctx, outcomes)) break
+    if (exit.createsAta && atasCreated >= maxAtaCreates) {
+      overCreateCap += 1
+      continue
+    }
     const attempt = await attemptExit(ctx, exit, blockhash)
     outcomes = [...outcomes, attempt.outcome]
     blockhash = attempt.blockhash
+    if (exit.createsAta && usesBudget(attempt.outcome)) atasCreated += 1
   }
-  return {
+  const result = {
     sent: outcomes.flatMap((o) => (o.kind === 'sent' ? [o.signature] : [])),
     skipped: exits.length - outcomes.length + outcomes.filter((o) => o.kind === 'skipped').length,
     errors: outcomes.flatMap((o) => (o.kind === 'error' ? [o.error] : [])),
   }
+  return { result, overCreateCap }
 }
 
-async function runAutoExits(ctx: CrankContext): Promise<CrankJobResult> {
-  if (ctx.maxTx <= 0) return { sent: [], skipped: 0, errors: [] }
+/** One line per tick for the exits left to their owners because their quote ATA is missing; no owner is named. */
+function logAtaSkips(ctx: CrankContext, guards: AutoExitGuards, belowMinValue: number, overCreateCap: number): void {
+  if (belowMinValue + overCreateCap === 0) return
+  ctx.log.info('auto-exit: quote ATA missing; exits left to their owners this tick', {
+    job: JOB_NAME,
+    belowMinValue,
+    overCreateCap,
+    minAtaValueLamports: guards.minAtaValueLamports,
+    maxAtaCreatesPerTick: guards.maxAtaCreatesPerTick,
+  })
+}
+
+async function runAutoExits(ctx: CrankContext, configured: AutoExitGuards | undefined): Promise<CrankJobResult> {
+  if (ctx.maxTx <= 0) return emptyResult()
   const cluster = ctx.cluster
   requirePlanPrograms(cluster)
+  const guards = configured ?? defaultCrankGuards(cluster.cluster)
+  if (!(await payerAboveFloor(ctx, guards.crankMinSolLamports))) return emptyResult()
   const [positions, nowUnix] = await Promise.all([fetchDeadlinePositions(ctx, cluster.routerProgramId), fetchChainUnixTime(ctx)])
   const due = positions.value.filter((position) => isDue(position, nowUnix))
   const markets = await fetchMarkets(ctx, cluster.routerProgramId, due)
   const poolProgress = await fetchPoolProgress(ctx, cluster.dbcProgramId, markets.value.values())
-  const exits = planExits(due, markets.value, poolProgress.value, nowUnix, ctx.payer.publicKey)
-  const executed = await executeExits(ctx, exits)
-  return { ...executed, errors: [...positions.errors, ...markets.errors, ...poolProgress.errors, ...executed.errors] }
+  const targets = due.flatMap((position) => exitTarget(position, markets.value, poolProgress.value) ?? [])
+  const ownerQuoteAtaExists = await fetchAtaExistence(ctx, targets)
+  const ata: AtaRule = { ownerQuoteAtaExists, minAtaValueLamports: guards.minAtaValueLamports }
+  const plan = planExits(due, markets.value, poolProgress.value, nowUnix, ctx.payer.publicKey, ata)
+  const executed = await executeExits(ctx, plan.exits, guards.maxAtaCreatesPerTick)
+  logAtaSkips(ctx, guards, plan.belowMinValue, executed.overCreateCap)
+  const { result } = executed
+  return {
+    ...result,
+    skipped: result.skipped + plan.belowMinValue,
+    errors: [...positions.errors, ...markets.errors, ...poolProgress.errors, ...result.errors],
+  }
 }
 
 /** RPC errors can quote the RPC URL, and with it the provider key: every error string leaves with URLs reduced to hosts. */
@@ -492,14 +603,22 @@ function redactErrors(result: CrankJobResult): CrankJobResult {
   return { ...result, errors: result.errors.map(redactUrls) }
 }
 
-/** Exits every due position on a live curve (simulated first), at most ctx.maxTx per tick. Never throws. */
-export const autoExitJob: CrankJob = Object.freeze({
-  name: JOB_NAME,
-  async run(ctx: CrankContext): Promise<CrankJobResult> {
-    try {
-      return redactErrors(await runAutoExits(ctx))
-    } catch (err) {
-      return redactErrors({ sent: [], skipped: 0, errors: [`${JOB_NAME}: ${errorMessage(err)}`] })
-    }
-  },
-})
+/**
+ * The job: exits every due position on a live curve (simulated first), at most ctx.maxTx per tick, within `guards`.
+ * Without `guards` it uses defaultCrankGuards for ctx.cluster; the worker passes its WorkerConfig. Never throws.
+ */
+export function createAutoExitJob(guards?: AutoExitGuards): CrankJob {
+  return Object.freeze({
+    name: JOB_NAME,
+    async run(ctx: CrankContext): Promise<CrankJobResult> {
+      try {
+        return redactErrors(await runAutoExits(ctx, guards))
+      } catch (err) {
+        return redactErrors({ sent: [], skipped: 0, errors: [`${JOB_NAME}: ${errorMessage(err)}`] })
+      }
+    },
+  })
+}
+
+/** The job with the default guards of ctx.cluster. */
+export const autoExitJob: CrankJob = createAutoExitJob()

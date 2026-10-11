@@ -33,24 +33,40 @@ import {
   findPositionPda,
   getClusterConfig,
   marketAccountsFor,
+  refundFor,
   type MarketAccount,
   type PositionAccount,
   type QuoteMintInfo,
 } from '@trucee/sdk'
 import { describe, expect, it, vi } from 'vitest'
+import { DEFAULT_MIN_ATA_VALUE_LAMPORTS, type CrankGuards } from '../src/config.js'
 import type { CrankContext, CrankJobResult } from '../src/crank/index.js'
 import {
   CONFIRM_TIMEOUT_MS,
   MAX_ATTEMPTS_PER_TX,
   RPC_TIMEOUT_MS,
-  autoExitJob,
+  autoExitJob as defaultAutoExitJob,
+  createAutoExitJob,
   planAutoExits,
+  type AtaRule,
 } from '../src/crank/jobs/auto-exit.js'
 
 const cluster = getClusterConfig('localnet')
 const NOW = 1_800_000_000n
 const TOKENS = 5_000_000n
 const BASIS = 100_000_000n
+/** A basis whose refund is far below MIN_ATA_VALUE_LAMPORTS (0.05 SOL). */
+const DUST_BASIS = 1_000_000n
+const FUNDED_LAMPORTS = 10_000_000_000
+/** No ATA rent guard: the CRK-05 tests are about exits; the CRK-10 tests pass their own guards. */
+const OPEN_GUARDS: CrankGuards = Object.freeze({
+  minAtaValueLamports: 0n,
+  maxAtaCreatesPerTick: Number.MAX_SAFE_INTEGER,
+  crankMinSolLamports: 0n,
+  minMigrateThresholdSolLamports: 0n,
+})
+const NO_ATAS: AtaRule = Object.freeze({ ownerQuoteAtaExists: new Map<string, boolean>(), minAtaValueLamports: 0n })
+const autoExitJob = createAutoExitJob(OPEN_GUARDS)
 const LIVE = 0
 /** DBC MigrationProgress: PostBondingCurve, LockedVesting, CreatedPool. */
 const COMPLETE_STAGES = [1, 2, 3] as const
@@ -117,8 +133,8 @@ function scenario(entries: readonly { market: MarketAccount; position: PositionA
   }
 }
 
-function plan(s: Scenario, payer: PublicKey, now: bigint = NOW): TransactionInstruction[][] {
-  return planAutoExits(s.positions, s.markets, s.poolProgress, now, payer)
+function plan(s: Scenario, payer: PublicKey, now: bigint = NOW, ata: AtaRule = NO_ATAS): TransactionInstruction[][] {
+  return planAutoExits(s.positions, s.markets, s.poolProgress, now, payer, ata)
 }
 
 const normalize = (ix: TransactionInstruction) => ({
@@ -269,8 +285,52 @@ describe('planAutoExits', () => {
     const s = scenario([{ market, position: makePosition(market, { autoExitDeadline: NOW - 1n }) }, { market, position: makePosition(market, { autoExitDeadline: NOW - 9n }) }])
     const positions = Object.freeze([...s.positions]) as PositionAccount[]
 
-    expect(() => planAutoExits(positions, s.markets, s.poolProgress, NOW, payer)).not.toThrow()
+    expect(() => planAutoExits(positions, s.markets, s.poolProgress, NOW, payer, NO_ATAS)).not.toThrow()
     expect(positions).toEqual(s.positions)
+  })
+
+  describe('owner quote ATA rent (CRK-10)', () => {
+    const ataOf = (position: PositionAccount): string =>
+      getAssociatedTokenAddressSync(SOL.mint, position.owner, false, SOL.tokenProgram).toBase58()
+    const rule = (minAtaValueLamports: bigint, existing: readonly PositionAccount[] = []): AtaRule => ({
+      ownerQuoteAtaExists: new Map(existing.map((position) => [ataOf(position), true])),
+      minAtaValueLamports,
+    })
+
+    it('plans no instructions for a missing ATA whose refund is below MIN_ATA_VALUE_LAMPORTS', () => {
+      const market = makeMarket()
+      const s = scenario([{ market, position: makePosition(market, { basis: DUST_BASIS }) }])
+
+      expect(plan(s, payer, NOW, rule(DEFAULT_MIN_ATA_VALUE_LAMPORTS))).toEqual([])
+    })
+
+    it('creates a missing ATA, then exits, once refundFor(basis, fee) reaches MIN_ATA_VALUE_LAMPORTS', () => {
+      const market = makeMarket()
+      const position = makePosition(market)
+      const s = scenario([{ market, position }])
+      const refund = refundFor(position.basis, market.feeNumerator)
+
+      expect(plan(s, payer, NOW, rule(refund)).map((tx) => tx.map(normalize))).toEqual([
+        expectedExit(market, SOL, position.owner, payer).map(normalize),
+      ])
+      expect(plan(s, payer, NOW, rule(refund + 1n))).toEqual([])
+    })
+
+    it('exits a dust position with no ATA create when its quote ATA exists (no threshold)', () => {
+      const market = makeMarket()
+      const position = makePosition(market, { basis: 1n })
+
+      const txs = plan(scenario([{ market, position }]), payer, NOW, rule(DEFAULT_MIN_ATA_VALUE_LAMPORTS, [position]))
+
+      expect(txs.map((tx) => tx.map(normalize))).toEqual([expectedExit(market, SOL, position.owner, payer).slice(1).map(normalize)])
+    })
+
+    it('skips, without throwing, an owner off the ed25519 curve (it has no canonical ATA)', () => {
+      const market = makeMarket()
+      const s = scenario([{ market, position: makePosition(market, { owner: findMarketPda(randomKey()) }) }])
+
+      expect(plan(s, payer)).toEqual([])
+    })
   })
 })
 
@@ -346,6 +406,8 @@ interface Chain {
   readonly clock: Buffer | null
   readonly simulate?: (tx: VersionedTransaction, index: number) => SimulationValue
   readonly confirmErr?: TransactionError | null
+  /** The crank payer's lamports; FUNDED_LAMPORTS when absent. */
+  readonly payerBalance?: number
 }
 
 const accountInfo = (data: Buffer, owner: PublicKey = ROUTER_PROGRAM_ID) => ({ data, owner, lamports: 1_000_000, executable: false, rentEpoch: 0 })
@@ -357,6 +419,7 @@ function fakeConnection(chain: Chain) {
   const sent: VersionedTransaction[] = []
   const blockhashes: string[] = []
   const fake = {
+    getBalance: vi.fn(async (_key: PublicKey, _commitment?: unknown) => chain.payerBalance ?? FUNDED_LAMPORTS),
     getProgramAccounts: vi.fn(async (_programId: PublicKey, _config?: unknown) =>
       chain.positions.map(({ address, data }) => ({ pubkey: address, account: accountInfo(data) })),
     ),
@@ -717,6 +780,7 @@ describe('autoExitJob', () => {
   })
 
   it.each([
+    'getBalance',
     'getProgramAccounts',
     'getAccountInfo',
     'getMultipleAccountsInfo',
@@ -798,5 +862,70 @@ describe('autoExitJob', () => {
     })
 
     await expect(autoExitJob.run(ctx)).resolves.toEqual({ sent: [], skipped: 0, errors: [expect.stringContaining('no cluster config')] })
+  })
+})
+
+describe('autoExitJob ATA rent and payer guards (CRK-10)', () => {
+  const guards = (overrides: Partial<CrankGuards> = {}): CrankGuards => ({ ...OPEN_GUARDS, minAtaValueLamports: DEFAULT_MIN_ATA_VALUE_LAMPORTS, maxAtaCreatesPerTick: 2, ...overrides })
+  const dustEntry = (deadline: bigint): ChainEntry => {
+    const market = makeMarket()
+    return { market, position: makePosition(market, { autoExitDeadline: deadline, basis: DUST_BASIS }) }
+  }
+  const instructionsOf = (tx: VersionedTransaction | undefined) => (tx === undefined ? [] : TransactionMessage.decompile(tx.message).instructions)
+  const createsAta = (tx: VersionedTransaction): boolean => instructionsOf(tx).some((ix) => ix.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID))
+  const withAccountAt = (chain: Chain, address: PublicKey, owner: PublicKey): Chain =>
+    ({ ...chain, accounts: new Map([...chain.accounts, [address.toBase58(), { data: Buffer.alloc(165), owner }]]) })
+
+  it('creates at most MAX_ATA_CREATES_PER_TICK missing ATAs per tick and logs the rest once', async () => {
+    const log = fakeLog()
+    const chain = fakeConnection(chainOf(dueEntries(3)))
+
+    const result = await createAutoExitJob(guards()).run(context(chain.connection, Keypair.generate(), 10, log))
+
+    expect(result).toEqual({ sent: ['sig-1', 'sig-2'], skipped: 1, errors: [] })
+    expect(chain.sent.filter(createsAta)).toHaveLength(2)
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining('quote ATA missing'), expect.objectContaining({ belowMinValue: 0, overCreateCap: 1 }))
+  })
+
+  it.each([
+    ['owned by the quote token program, exits it without an ATA create', TOKEN_PROGRAM_ID, ['sig-1']],
+    ['owned by the system program (lamports sent to it), treats it as missing and skips the dust', SystemProgram.programId, []],
+  ])('for a dust refund and an account at the quote ATA address %s', async (_, owner, sent) => {
+    const entry = dustEntry(CHAIN_NOW - 5n)
+    const ata = getAssociatedTokenAddressSync(SOL.mint, entry.position.owner, false, TOKEN_PROGRAM_ID)
+    const chain = fakeConnection(withAccountAt(chainOf([entry]), ata, owner))
+
+    const result = await createAutoExitJob(guards()).run(context(chain.connection, Keypair.generate()))
+
+    expect(result.sent).toEqual(sent)
+    expect(chain.sent.filter(createsAta)).toEqual([])
+    expect(chain.fake.getMultipleAccountsInfo.mock.calls.some(([keys]) => keys.some((key) => key.equals(ata)))).toBe(true)
+  })
+
+  it('logs once and plans nothing while the payer holds less than CRANK_MIN_SOL_LAMPORTS (default 0.05 SOL)', async () => {
+    const payer = Keypair.generate()
+    const [below, atFloor] = [49_999_999, 50_000_000].map((payerBalance) => fakeConnection(chainOf([dueEntry()], { payerBalance })))
+    const log = fakeLog()
+
+    const skipped = await defaultAutoExitJob.run(context(below!.connection, payer, 10, log))
+    const ran = await defaultAutoExitJob.run(context(atFloor!.connection, payer))
+
+    expect(skipped).toEqual({ sent: [], skipped: 0, errors: [] })
+    expect(below!.fake.getBalance).toHaveBeenCalledWith(payer.publicKey, 'confirmed')
+    expect(below!.fake.getProgramAccounts).not.toHaveBeenCalled()
+    expect([log.info, log.warn, log.error].map((fn) => fn.mock.calls.length)).toEqual([0, 1, 0])
+    expect(ran.sent).toEqual(['sig-1'])
+  })
+
+  it('exits a real overdue position this tick even behind 50 dust positions with earlier deadlines', async () => {
+    const dust = Array.from({ length: 50 }, (_, i) => dustEntry(CHAIN_NOW - 1_000n + BigInt(i)))
+    const real = dueEntry(CHAIN_NOW - 5n)
+    const chain = fakeConnection(chainOf([...dust, real]))
+
+    const result = await createAutoExitJob(guards()).run(context(chain.connection, Keypair.generate(), 1))
+
+    expect(result).toEqual({ sent: ['sig-1'], skipped: 50, errors: [] })
+    expect(chain.fake.simulateTransaction).toHaveBeenCalledTimes(1)
+    expect(instructionsOf(chain.sent[0])[1]?.keys[3]?.pubkey.equals(real.position.address)).toBe(true)
   })
 })

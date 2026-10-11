@@ -3,7 +3,7 @@ import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Connection, Keypair } from '@solana/web3.js'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import { loadConfig, loadCrankKeypair, type WorkerConfig } from '../src/config.js'
+import { defaultCrankGuards, loadConfig, loadCrankKeypair, type WorkerConfig } from '../src/config.js'
 import { startCrank, type CrankContext, type CrankJob } from '../src/crank/index.js'
 import { log, registerSecret } from '../src/log.js'
 
@@ -97,6 +97,10 @@ describe('loadConfig', () => {
       crankKeypairPath: join(homedir(), '.config', 'solana', 'id.json'),
       crankIntervalMs: 15000,
       maxTxPerTick: 10,
+      minAtaValueLamports: 50_000_000n,
+      maxAtaCreatesPerTick: 2,
+      crankMinSolLamports: 50_000_000n,
+      minMigrateThresholdSolLamports: 0n,
     })
   })
 
@@ -107,6 +111,10 @@ describe('loadConfig', () => {
       CRANK_KEYPAIR: '~/keys/crank.json',
       CRANK_INTERVAL_MS: '500',
       MAX_TX_PER_TICK: '3',
+      MIN_ATA_VALUE_LAMPORTS: '0',
+      MAX_ATA_CREATES_PER_TICK: '0',
+      CRANK_MIN_SOL_LAMPORTS: '1000000000',
+      MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS: '303000000',
     })
 
     expect(cfg).toEqual<WorkerConfig>({
@@ -115,8 +123,38 @@ describe('loadConfig', () => {
       crankKeypairPath: join(homedir(), 'keys', 'crank.json'),
       crankIntervalMs: 500,
       maxTxPerTick: 3,
+      minAtaValueLamports: 0n,
+      maxAtaCreatesPerTick: 0,
+      crankMinSolLamports: 1_000_000_000n,
+      minMigrateThresholdSolLamports: 303_000_000n,
     })
   })
+
+  it('defaults MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS by cluster: 1 SOL on mainnet-beta, 0 on devnet and localnet', () => {
+    const base = { RPC_URL: SECRET_RPC_URL }
+
+    expect(loadConfig({ ...base, CLUSTER: 'mainnet-beta' }).minMigrateThresholdSolLamports).toBe(1_000_000_000n)
+    expect(loadConfig({ ...base, CLUSTER: 'mainnet-beta', MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS: '' }).minMigrateThresholdSolLamports).toBe(1_000_000_000n)
+    expect(loadConfig({ ...base, CLUSTER: 'mainnet-beta', MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS: '0' }).minMigrateThresholdSolLamports).toBe(0n)
+    expect(loadConfig({ ...base, CLUSTER: 'devnet' }).minMigrateThresholdSolLamports).toBe(0n)
+    expect(loadConfig({ ...base, CLUSTER: 'localnet' }).minMigrateThresholdSolLamports).toBe(0n)
+    expect(defaultCrankGuards('mainnet-beta')).toEqual({
+      minAtaValueLamports: 50_000_000n,
+      maxAtaCreatesPerTick: 2,
+      crankMinSolLamports: 50_000_000n,
+      minMigrateThresholdSolLamports: 1_000_000_000n,
+    })
+  })
+
+  it.each(['MIN_ATA_VALUE_LAMPORTS', 'MAX_ATA_CREATES_PER_TICK', 'CRANK_MIN_SOL_LAMPORTS', 'MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS'])(
+    'throws when %s is not a non-negative integer',
+    (key) => {
+      const base = { CLUSTER: 'devnet', RPC_URL: SECRET_RPC_URL }
+      for (const bad of ['-1', '2.5', 'lots', '9007199254740993']) {
+        expect(() => loadConfig({ ...base, [key]: bad })).toThrow(new RegExp(`${key} must be a non-negative integer`))
+      }
+    },
+  )
 
   it('never puts the RPC_URL value in the thrown error', () => {
     const badEnvs: NodeJS.ProcessEnv[] = [
@@ -278,6 +316,7 @@ describe('startCrank', () => {
       crankKeypairPath: keypairPath,
       crankIntervalMs: TEST_INTERVAL_MS,
       maxTxPerTick: 10,
+      ...defaultCrankGuards('devnet'),
       ...overrides,
     }
   }

@@ -16,8 +16,10 @@ import {
   type MigrateToDammV2Response,
   type TransferHookPool,
 } from '@meteora-ag/dynamic-bonding-curve-sdk'
+import { NATIVE_MINT } from '@solana/spl-token'
 import { getClusterConfig } from '@trucee/sdk'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { defaultCrankGuards } from '../src/config.js'
 import type { CrankContext } from '../src/crank/index.js'
 import {
   CONFIRM_TIMEOUT_MS,
@@ -54,6 +56,9 @@ const MARKET_DISCRIMINATOR = [219, 190, 213, 55, 0, 227, 198, 154]
 const MARKET_ACCOUNT_SIZE = 274
 const MARKET_POOL_OFFSET = 8
 const MARKET_CONFIG_OFFSET = 40
+const FUNDED_LAMPORTS = 10_000_000_000
+/** The devnet demo launch's migration quote threshold (0.303 SOL). */
+const DEMO_THRESHOLD_LAMPORTS = 303_000_000n
 
 const { LOCKED_VESTING, CREATED_POOL, PRE_BONDING_CURVE, POST_BONDING_CURVE } = MIGRATION_PROGRESS
 
@@ -94,8 +99,8 @@ function poolSnapshot(migrationProgress: number, isMigrated: boolean, config: Pu
 const ok = <T>(value: T): LoadResult<T> => ({ ok: true, value })
 const failed = <T>(error: string): LoadResult<T> => ({ ok: false, error })
 
-function configSnapshot(migrationFeeOption: number): ConfigSnapshot {
-  return { quoteMint: newKey(), migrationFeeOption }
+function configSnapshot(migrationFeeOption: number, overrides: Partial<ConfigSnapshot> = {}): ConfigSnapshot {
+  return { quoteMint: newKey(), migrationFeeOption, migrationQuoteThreshold: 0n, ...overrides }
 }
 
 /** A migrate_damm_v2 stand-in whose instruction needs the payer and both position-NFT mints as signers. */
@@ -177,6 +182,10 @@ async function runPastTimeout<T>(run: () => Promise<T>, stalled: { mock: { calls
     vi.useRealTimers()
   }
 }
+
+beforeEach(() => {
+  vi.spyOn(Connection.prototype, 'getBalance').mockResolvedValue(FUNDED_LAMPORTS)
+})
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -688,6 +697,56 @@ describe('migrate job run', () => {
     expect(none).toEqual({ sent: [], skipped: 3, errors: [] })
     expect(buildMigration).toHaveBeenCalledTimes(1)
     expect(rpc.send).toHaveBeenCalledTimes(1)
+  })
+
+  describe('crank guards (CRK-10)', () => {
+    /** One ready pool per quote mint, each with the 0.303 SOL demo threshold. */
+    function demoPools(quoteMints: readonly PublicKey[]) {
+      const pools = quoteMints.map(() => poolSnapshot(LOCKED_VESTING, false))
+      const snapshots = quoteMints.map((quoteMint) => configSnapshot(0, { quoteMint, migrationQuoteThreshold: DEMO_THRESHOLD_LAMPORTS }))
+      const configs = new Map(pools.map((pool, i) => [pool.config.toBase58(), snapshots[i]!]))
+      const buildMigration = vi.fn(async (ctx: CrankContext, _target: MigrationTarget) => fakeMigration(ctx.payer.publicKey))
+      return { pools, deps: stubDeps(pools, { configs, overrides: { buildMigration } }), buildMigration }
+    }
+
+    it('migrates the 0.303 SOL demo threshold under the devnet default MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS (0)', async () => {
+      const { deps } = demoPools([NATIVE_MINT])
+      const connection = new Connection(LOCAL_RPC_URL)
+      mockSendPath(connection)
+
+      const result = await createMigrateJob(deps, defaultCrankGuards('devnet')).run(testContext({ connection }))
+
+      expect(result).toEqual({ sent: [SIGNATURE], skipped: 0, errors: [] })
+    })
+
+    it('skips, with one log line, a wSOL pool below the mainnet-beta minimum (1 SOL); a non-SOL quote has none', async () => {
+      const { pools, deps, buildMigration } = demoPools([NATIVE_MINT, newKey()])
+      const connection = new Connection(LOCAL_RPC_URL)
+      mockSendPath(connection)
+      const { logger, lines } = recordingLogger()
+
+      const result = await createMigrateJob(deps, defaultCrankGuards('mainnet-beta')).run(testContext({ connection, logger }))
+
+      expect(result).toEqual({ sent: [SIGNATURE], skipped: 1, errors: [] })
+      expect(buildMigration.mock.calls.map(([, target]) => target.pool.toBase58())).toEqual([pools[1]!.pool.toBase58()])
+      const skippedLines = lines.filter((line) => line.ctx.pool === pools[0]!.pool.toBase58())
+      expect(skippedLines).toHaveLength(1)
+      expect(skippedLines[0]?.ctx).toMatchObject({ migrationQuoteThreshold: DEMO_THRESHOLD_LAMPORTS, minThresholdLamports: 1_000_000_000n })
+    })
+
+    it('sends no migration while the payer holds less than CRANK_MIN_SOL_LAMPORTS, with one log line', async () => {
+      vi.spyOn(Connection.prototype, 'getBalance').mockResolvedValue(49_999_999)
+      const { deps, buildMigration } = demoPools([NATIVE_MINT])
+      const listMarkets = vi.fn(deps.listMarkets)
+      const { logger, lines } = recordingLogger()
+
+      const result = await createMigrateJob({ ...deps, listMarkets }, defaultCrankGuards('devnet')).run(testContext({ logger }))
+
+      expect(result).toEqual({ sent: [], skipped: 0, errors: [] })
+      expect(listMarkets).not.toHaveBeenCalled()
+      expect(buildMigration).not.toHaveBeenCalled()
+      expect(lines.map((line) => line.level)).toEqual(['warn'])
+    })
   })
 })
 

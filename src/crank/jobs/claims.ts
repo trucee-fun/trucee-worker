@@ -7,6 +7,11 @@
  * fetches one blockhash and sends the claims in order. Every RPC call is bounded by a wall-clock timeout, and a tick
  * attempts at most ctx.maxTx * MAX_ATTEMPTS_PER_TX claims, so positions whose claim keeps failing cost a bounded
  * number of calls per tick.
+ *
+ * ATA rent guard (CRK-10): an owner can close the ATA the crank paid for and keep its rent, so a missing ATA is created
+ * only when the surplus share is at least minAtaValueLamports, and at most maxAtaCreatesPerTick ATAs are created per
+ * tick. Any other claim with a missing ATA is skipped (left to the owner) without using the tick's budget. While the
+ * payer holds less than crankMinSolLamports, the job plans nothing.
  */
 import { Buffer } from 'node:buffer'
 import {
@@ -22,6 +27,7 @@ import {
   type TransactionInstruction,
 } from '@solana/web3.js'
 import {
+  ASSOCIATED_TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
   createAssociatedTokenAccountIdempotentInstruction,
@@ -39,6 +45,7 @@ import {
   type MarketAccounts,
   type PositionAccount,
 } from '@trucee/sdk'
+import { DEFAULT_MIN_ATA_VALUE_LAMPORTS, defaultCrankGuards, type CrankGuards } from '../../config.js'
 import { errorMessage, redactUrls } from '../../log.js'
 import type { CrankContext, CrankJob, CrankJobResult } from '../index.js'
 
@@ -63,6 +70,10 @@ const QUOTE_TOKEN_PROGRAMS: readonly PublicKey[] = Object.freeze([TOKEN_PROGRAM_
 /** Router, hook and DBC program ids are the same on every cluster; claimsJob passes ctx.cluster anyway. */
 const DEFAULT_CLUSTER: ClusterConfig = getClusterConfig('devnet')
 const TIMED_OUT: unique symbol = Symbol('timed out')
+const U64_MAX = (1n << 64n) - 1n
+
+/** The guards this job applies (CRK-10); WorkerConfig satisfies it. */
+export type ClaimsGuards = Pick<CrankGuards, 'minAtaValueLamports' | 'maxAtaCreatesPerTick' | 'crankMinSolLamports'>
 
 /* ---------- planner ---------- */
 
@@ -86,13 +97,23 @@ function ownerQuoteAta(accounts: MarketAccounts, owner: PublicKey): PublicKey {
   return getAssociatedTokenAddressSync(accounts.quoteMint, owner, false, accounts.quoteTokenProgram)
 }
 
+/** Router math::surplus_share: floor(surplus_snapshot * basis / basis_snapshot); 0 for a zero snapshot or a u64 overflow. */
+function surplusShare(market: MarketAccount, position: PositionAccount): bigint {
+  if (market.basisSnapshot === 0n) return 0n
+  const share = (market.surplusSnapshot * position.basis) / market.basisSnapshot
+  return share > U64_MAX ? 0n : share
+}
+
 function planClaim(
   accounts: MarketAccounts,
-  owner: PublicKey,
+  market: MarketAccount,
+  position: PositionAccount,
   ownerQuoteAtaExists: ReadonlyMap<string, boolean>,
   payer: PublicKey,
   cluster: ClusterConfig,
+  minAtaValueLamports: bigint,
 ): TransactionInstruction[] {
+  const owner = position.owner
   const ownerQuote = ownerQuoteAta(accounts, owner)
   const claim = claimSurplusInstruction({ cluster, accounts, cranker: payer, owner })
   // The router enforces this too; failing here keeps a wrong builder from ever reaching the chain.
@@ -100,6 +121,7 @@ function planClaim(
     throw new Error(`claim_surplus for owner ${owner.toBase58()} does not pay the owner's canonical quote ATA`)
   }
   if (ownerQuoteAtaExists.get(ownerQuote.toBase58()) === true) return [claim]
+  if (surplusShare(market, position) < minAtaValueLamports) return []
   const createAta = createAssociatedTokenAccountIdempotentInstruction(
     payer, ownerQuote, owner, accounts.quoteMint, accounts.quoteTokenProgram,
   )
@@ -109,9 +131,11 @@ function planClaim(
 /**
  * One transaction per position, in input order: claim_surplus with `payer` as cranker, preceded by an idempotent
  * creation (paid by `payer`) of the owner's canonical quote ATA unless `ownerQuoteAtaExists` maps that ATA's
- * base58 address to true. Plans nothing until the market is finalized.
+ * base58 address to true. A position whose ATA is missing and whose surplus share is below `minAtaValueLamports`
+ * gets an empty list (no transaction). Plans nothing until the market is finalized.
  *
  * @param cluster program ids for the instructions; defaults to the SDK's, which are the same on every cluster.
+ * @param minAtaValueLamports least surplus share for which the crank creates (pays the rent of) a missing quote ATA.
  * @throws when `quoteTokenProgram` is not SPL Token or Token-2022, when a position belongs to another market,
  *   when a position owner is off the ed25519 curve (no canonical ATA can be derived for it), or when the SDK's
  *   claim instruction would pay any account other than the owner's canonical quote ATA.
@@ -123,11 +147,12 @@ export function planClaims(
   payer: PublicKey,
   quoteTokenProgram: PublicKey,
   cluster: ClusterConfig = DEFAULT_CLUSTER,
+  minAtaValueLamports: bigint = DEFAULT_MIN_ATA_VALUE_LAMPORTS,
 ): TransactionInstruction[][] {
   if (!market.finalized) return []
   const accounts = marketAccountsFor(market, requireQuoteTokenProgram(quoteTokenProgram))
   return positions.map((position) =>
-    planClaim(accounts, requirePositionOf(market, position).owner, ownerQuoteAtaExists, payer, cluster),
+    planClaim(accounts, market, requirePositionOf(market, position), ownerQuoteAtaExists, payer, cluster, minAtaValueLamports),
   )
 }
 
@@ -249,15 +274,27 @@ interface PlannedClaim {
   readonly market: MarketAccount
   readonly position: PositionAccount
   readonly instructions: TransactionInstruction[]
+  /** The transaction creates the owner's quote ATA, its rent paid by the crank. */
+  readonly createsAta: boolean
 }
 
 interface MarketPlan {
   readonly claims: readonly PlannedClaim[]
   readonly skipped: number
+  /** Claims skipped because the owner's quote ATA is missing and the share is below minAtaValueLamports. */
+  readonly belowMinValue: number
   readonly errors: readonly string[]
 }
 
-async function readAndPlanMarket(ctx: CrankContext, cluster: ClusterConfig, market: MarketAccount): Promise<MarketPlan> {
+const includesAtaCreate = (instructions: readonly TransactionInstruction[]): boolean =>
+  instructions[0]?.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID) === true
+
+async function readAndPlanMarket(
+  ctx: CrankContext,
+  cluster: ClusterConfig,
+  market: MarketAccount,
+  minAtaValueLamports: bigint,
+): Promise<MarketPlan> {
   const quoteTokenProgram = quoteTokenProgramOf(cluster, market)
   const fetched = await fetchMarketPositions(ctx.connection, cluster.routerProgramId, market)
   const claimable = fetched.positions.filter((position) => isOnCurve(position.owner))
@@ -266,20 +303,29 @@ async function readAndPlanMarket(ctx: CrankContext, cluster: ClusterConfig, mark
   const accounts = marketAccountsFor(market, quoteTokenProgram)
   const atas = claimable.map((position) => ownerQuoteAta(accounts, position.owner))
   const ataExists = await fetchAtaExistence(ctx.connection, atas, quoteTokenProgram)
-  const plan = planClaims(market, claimable, ataExists, ctx.payer.publicKey, quoteTokenProgram, cluster)
+  const plan = planClaims(market, claimable, ataExists, ctx.payer.publicKey, quoteTokenProgram, cluster, minAtaValueLamports)
   if (plan.length !== claimable.length) {
     throw new Error(`planned ${plan.length} claims for ${claimable.length} positions`)
   }
-  const claims = claimable.map((position, i) => ({ market, position, instructions: plan[i] ?? [] }))
-  return { claims, skipped: offCurve.length, errors: fetched.errors }
+  const claims = claimable
+    .map((position, i) => ({ market, position, instructions: plan[i] ?? [] }))
+    .filter((claim) => claim.instructions.length > 0)
+    .map((claim) => ({ ...claim, createsAta: includesAtaCreate(claim.instructions) }))
+  const belowMinValue = claimable.length - claims.length
+  return { claims, skipped: offCurve.length + belowMinValue, belowMinValue, errors: fetched.errors }
 }
 
 /** Reads and plans one finalized market. Never throws: a failure becomes the market's only error. */
-async function planMarket(ctx: CrankContext, cluster: ClusterConfig, market: MarketAccount): Promise<MarketPlan> {
+async function planMarket(
+  ctx: CrankContext,
+  cluster: ClusterConfig,
+  market: MarketAccount,
+  minAtaValueLamports: bigint,
+): Promise<MarketPlan> {
   try {
-    return await readAndPlanMarket(ctx, cluster, market)
+    return await readAndPlanMarket(ctx, cluster, market, minAtaValueLamports)
   } catch (err) {
-    return { claims: [], skipped: 0, errors: [`market ${market.address.toBase58()}: ${errorMessage(err)}`] }
+    return { claims: [], skipped: 0, belowMinValue: 0, errors: [`market ${market.address.toBase58()}: ${errorMessage(err)}`] }
   }
 }
 
@@ -368,9 +414,13 @@ interface Tally {
   readonly submitted: number
   /** Claims attempted this tick (simulated at least); capped at ctx.maxTx * MAX_ATTEMPTS_PER_TX. */
   readonly attempts: number
+  /** Submitted transactions that create an owner quote ATA; capped at maxAtaCreatesPerTick. */
+  readonly atasCreated: number
+  /** Claims not tried because maxAtaCreatesPerTick ATAs were already created this tick. */
+  readonly overCreateCap: number
 }
 
-const EMPTY_TALLY: Tally = Object.freeze({ sent: [], skipped: 0, errors: [], submitted: 0, attempts: 0 })
+const EMPTY_TALLY: Tally = Object.freeze({ sent: [], skipped: 0, errors: [], submitted: 0, attempts: 0, atasCreated: 0, overCreateCap: 0 })
 
 /** Every error string passes through redactUrls: web3.js errors can embed the RPC URL and its API key. */
 const withErrors = (tally: Tally, errors: readonly string[]): Tally => ({
@@ -414,24 +464,42 @@ function recordOutcome(ctx: CrankContext, claim: PlannedClaim, tally: Tally, out
 
 /* ---------- job ---------- */
 
-/** Reads and plans finalized markets in order until there are enough claims to fill the tick's attempt cap. */
-async function planTick(ctx: CrankContext, cluster: ClusterConfig): Promise<MarketPlan> {
+/** Claims a tick can attempt: every claim into an existing ATA, and at most `maxAtaCreates` that create one. */
+function attemptable(claims: readonly PlannedClaim[], maxAtaCreates: number): number {
+  const creating = claims.filter((claim) => claim.createsAta).length
+  return claims.length - creating + Math.min(creating, maxAtaCreates)
+}
+
+/**
+ * Reads and plans finalized markets in order until there are enough claims to fill the tick's attempt cap. Claims
+ * skipped for a missing ATA (below the value or over the create cap) do not count toward it.
+ */
+async function planTick(ctx: CrankContext, cluster: ClusterConfig, guards: ClaimsGuards): Promise<MarketPlan> {
   const markets = await rpc(fetchAllMarkets(ctx.connection, cluster.routerProgramId), 'fetchAllMarkets')
   let claims: readonly PlannedClaim[] = []
   let skipped = 0
+  let belowMinValue = 0
   let errors: readonly string[] = []
   for (const market of markets.filter((candidate) => candidate.finalized)) {
-    if (claims.length >= maxAttempts(ctx.maxTx)) break
-    const plan = await planMarket(ctx, cluster, market)
+    if (attemptable(claims, guards.maxAtaCreatesPerTick) >= maxAttempts(ctx.maxTx)) break
+    const plan = await planMarket(ctx, cluster, market, guards.minAtaValueLamports)
     claims = [...claims, ...plan.claims]
     skipped += plan.skipped
+    belowMinValue += plan.belowMinValue
     errors = [...errors, ...plan.errors]
   }
-  return { claims, skipped, errors }
+  return { claims, skipped, belowMinValue, errors }
 }
 
-/** Sends the planned claims in order on one blockhash until ctx.maxTx sends or the attempt cap; the rest are skipped. */
-async function sendClaims(ctx: CrankContext, claims: readonly PlannedClaim[], tally: Tally): Promise<Tally> {
+/** sent, unknown, or failed after the transaction went out: an ATA it creates may exist now. */
+const wasSubmitted = (outcome: SubmitOutcome): boolean =>
+  outcome.kind === 'sent' || outcome.kind === 'unknown' || (outcome.kind === 'failed' && outcome.submitted)
+
+/**
+ * Sends the planned claims in order on one blockhash until ctx.maxTx sends or the attempt cap; the rest are skipped.
+ * A claim that would create an ATA is skipped once `maxAtaCreates` such transactions were submitted this tick.
+ */
+async function sendClaims(ctx: CrankContext, claims: readonly PlannedClaim[], tally: Tally, maxAtaCreates: number): Promise<Tally> {
   let blockhash: BlockhashWithExpiryBlockHeight
   try {
     blockhash = await rpc(ctx.connection.getLatestBlockhash(COMMITMENT), 'getLatestBlockhash')
@@ -441,27 +509,66 @@ async function sendClaims(ctx: CrankContext, claims: readonly PlannedClaim[], ta
   let current = tally
   for (const [i, claim] of claims.entries()) {
     if (!canAttempt(current, ctx.maxTx)) return withSkipped(current, claims.length - i)
+    if (claim.createsAta && current.atasCreated >= maxAtaCreates) {
+      current = { ...withSkipped(current, 1), overCreateCap: current.overCreateCap + 1 }
+      continue
+    }
     const outcome = await submitTransaction(ctx, blockhash, claim.instructions)
     current = recordOutcome(ctx, claim, { ...current, attempts: current.attempts + 1 }, outcome)
+    if (claim.createsAta && wasSubmitted(outcome)) current = { ...current, atasCreated: current.atasCreated + 1 }
   }
   return current
 }
 
-async function runClaims(ctx: CrankContext): Promise<CrankJobResult> {
-  if (ctx.maxTx <= 0) return toResult(EMPTY_TALLY)
-  const plan = await planTick(ctx, ctx.cluster)
-  const planned = withErrors(withSkipped(EMPTY_TALLY, plan.skipped), plan.errors)
-  if (plan.claims.length === 0) return toResult(planned)
-  return toResult(await sendClaims(ctx, plan.claims, planned))
+/** True when the payer holds at least `minLamports`; otherwise logs once and the job plans nothing this tick. */
+async function payerAboveFloor(ctx: CrankContext, minLamports: bigint): Promise<boolean> {
+  const balance = BigInt(await rpc(ctx.connection.getBalance(ctx.payer.publicKey, COMMITMENT), 'getBalance'))
+  if (balance >= minLamports) return true
+  ctx.log.warn('claims: crank payer balance below CRANK_MIN_SOL_LAMPORTS; nothing planned this tick', {
+    payer: ctx.payer.publicKey.toBase58(), balanceLamports: balance, minLamports,
+  })
+  return false
 }
 
-export const claimsJob: CrankJob = Object.freeze({
-  name: JOB_NAME,
-  async run(ctx: CrankContext): Promise<CrankJobResult> {
-    try {
-      return await runClaims(ctx)
-    } catch (err) {
-      return toResult(withError(EMPTY_TALLY, `claims: ${errorMessage(err)}`))
-    }
-  },
-})
+/** One line per tick for the claims left to their owners because their quote ATA is missing; no owner is named. */
+function logAtaSkips(ctx: CrankContext, guards: ClaimsGuards, belowMinValue: number, overCreateCap: number): void {
+  if (belowMinValue + overCreateCap === 0) return
+  ctx.log.info('claims: quote ATA missing; claims left to their owners this tick', {
+    belowMinValue,
+    overCreateCap,
+    minAtaValueLamports: guards.minAtaValueLamports,
+    maxAtaCreatesPerTick: guards.maxAtaCreatesPerTick,
+  })
+}
+
+async function runClaims(ctx: CrankContext, configured: ClaimsGuards | undefined): Promise<CrankJobResult> {
+  if (ctx.maxTx <= 0) return toResult(EMPTY_TALLY)
+  const cluster = ctx.cluster
+  const guards = configured ?? defaultCrankGuards(cluster.cluster)
+  if (!(await payerAboveFloor(ctx, guards.crankMinSolLamports))) return toResult(EMPTY_TALLY)
+  const plan = await planTick(ctx, cluster, guards)
+  const planned = withErrors(withSkipped(EMPTY_TALLY, plan.skipped), plan.errors)
+  const sent = plan.claims.length === 0 ? planned : await sendClaims(ctx, plan.claims, planned, guards.maxAtaCreatesPerTick)
+  logAtaSkips(ctx, guards, plan.belowMinValue, sent.overCreateCap)
+  return toResult(sent)
+}
+
+/**
+ * The claims job within `guards`. Without `guards` it uses defaultCrankGuards for ctx.cluster; the worker passes its
+ * WorkerConfig. Never throws.
+ */
+export function createClaimsJob(guards?: ClaimsGuards): CrankJob {
+  return Object.freeze({
+    name: JOB_NAME,
+    async run(ctx: CrankContext): Promise<CrankJobResult> {
+      try {
+        return await runClaims(ctx, guards)
+      } catch (err) {
+        return toResult(withError(EMPTY_TALLY, `claims: ${errorMessage(err)}`))
+      }
+    },
+  })
+}
+
+/** The claims job with the default guards of ctx.cluster. */
+export const claimsJob: CrankJob = createClaimsJob()
