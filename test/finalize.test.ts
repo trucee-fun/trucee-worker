@@ -8,8 +8,15 @@ import {
   type MarketAccount,
 } from '@trucee/sdk'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { DEFAULT_CRANK_MIN_SOL_LAMPORTS, defaultCrankGuards, type CrankGuards } from '../src/config.js'
 import type { CrankContext } from '../src/crank/index.js'
-import { CONFIRM_TIMEOUT_MS, finalizeJob, planFinalize } from '../src/crank/jobs/finalize.js'
+import {
+  CONFIRM_TIMEOUT_MS,
+  RPC_TIMEOUT_MS,
+  createFinalizeJob,
+  finalizeJob,
+  planFinalize,
+} from '../src/crank/jobs/finalize.js'
 import type { Logger } from '../src/log.js'
 
 const LOCAL_RPC_URL = 'http://127.0.0.1:8899'
@@ -40,6 +47,8 @@ const ALREADY_FINALIZED_ERR: TransactionError = { InstructionError: [0, { Custom
 /** A fake provider key inside an RPC URL, as raw web3.js errors embed it. */
 const FAKE_API_KEY = 'fake-api-key-0123456789'
 const KEYED_RPC_URL = `https://rpc.example.invalid/v1/?api-key=${FAKE_API_KEY}`
+/** Payer balance of every mocked connection unless a test sets one: 1 SOL, above any floor these tests use. */
+const FUNDED_LAMPORTS = 1_000_000_000
 
 const randomKey = (): PublicKey => Keypair.generate().publicKey
 
@@ -95,11 +104,14 @@ interface ChainState {
   readonly simulationLogs?: string[]
   /** Owner of every pool account; defaults to the cluster's DBC program. */
   readonly poolOwner?: PublicKey
+  /** The crank payer's balance in lamports; defaults to FUNDED_LAMPORTS. */
+  readonly payerBalance?: number
 }
 
 /** A real Connection whose RPC methods are all stubbed, so nothing touches the network. */
 function mockConnection(state: ChainState) {
   const connection = new Connection(LOCAL_RPC_URL)
+  const getBalance = vi.spyOn(connection, 'getBalance').mockResolvedValue(state.payerBalance ?? FUNDED_LAMPORTS)
   const getProgramAccounts = vi.spyOn(connection, 'getProgramAccounts').mockResolvedValue(
     state.markets.map((market) => ({
       pubkey: market.address,
@@ -127,6 +139,7 @@ function mockConnection(state: ChainState) {
     .mockResolvedValue({ context: { slot: 2 }, value: { err: null } })
   return {
     connection,
+    getBalance,
     getProgramAccounts,
     getMultipleAccountsInfo,
     getLatestBlockhash,
@@ -498,5 +511,101 @@ describe('finalizeJob', () => {
     const result = await finalizeJob.run(ctx)
 
     expect(result.errors).toEqual([expect.stringContaining('unknown cluster')])
+  })
+})
+
+/** Log calls per level: [info, warn, error]. */
+function logCounts(logger: Logger): number[] {
+  return [logger.info, logger.warn, logger.error].map((fn) => vi.mocked(fn).mock.calls.length)
+}
+
+describe('finalize payer floor (CRK-13)', () => {
+  const BELOW_DEFAULT_FLOOR = Number(DEFAULT_CRANK_MIN_SOL_LAMPORTS) - 1
+  /** A floor above FUNDED_LAMPORTS, so only guards passed to createFinalizeJob can stop a funded payer. */
+  const ENV_FLOOR = 2_000_000_000n
+  const envGuards: CrankGuards = { ...defaultCrankGuards('localnet'), crankMinSolLamports: ENV_FLOOR }
+
+  it('plans nothing and logs one line while the payer holds less than CRANK_MIN_SOL_LAMPORTS (default 0.05 SOL)', async () => {
+    const { market, pools } = dueMarket()
+    const rpc = mockConnection({ markets: [market], pools, payerBalance: BELOW_DEFAULT_FLOOR })
+    const logger = silentLogger()
+    const ctx = contextFor(rpc.connection, 5, logger)
+
+    const result = await finalizeJob.run(ctx)
+
+    expect(result).toEqual({ sent: [], skipped: 0, errors: [] })
+    expect(rpc.getBalance).toHaveBeenCalledWith(ctx.payer.publicKey, 'confirmed')
+    expect(rpc.getProgramAccounts).not.toHaveBeenCalled()
+    expect(rpc.simulateTransaction).not.toHaveBeenCalled()
+    expect(rpc.sendRawTransaction).not.toHaveBeenCalled()
+    expect(logCounts(logger)).toEqual([0, 1, 0])
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('CRANK_MIN_SOL_LAMPORTS'),
+      expect.objectContaining({
+        job: 'finalize',
+        payer: ctx.payer.publicKey.toBase58(),
+        balanceLamports: BigInt(BELOW_DEFAULT_FLOOR),
+        minLamports: DEFAULT_CRANK_MIN_SOL_LAMPORTS,
+      }),
+    )
+  })
+
+  it('finalizes once the payer holds exactly CRANK_MIN_SOL_LAMPORTS', async () => {
+    const { market, pools } = dueMarket()
+    const rpc = mockConnection({ markets: [market], pools, payerBalance: Number(DEFAULT_CRANK_MIN_SOL_LAMPORTS) })
+
+    const result = await finalizeJob.run(contextFor(rpc.connection, 5))
+
+    expect(result).toEqual({ sent: [SIGNATURE], skipped: 0, errors: [] })
+  })
+
+  it('createFinalizeJob plans nothing below the CRANK_MIN_SOL_LAMPORTS of its guards, with one log line', async () => {
+    const { market, pools } = dueMarket()
+    const rpc = mockConnection({ markets: [market], pools })
+    const logger = silentLogger()
+
+    const result = await createFinalizeJob(envGuards).run(contextFor(rpc.connection, 5, logger))
+
+    expect(result).toEqual({ sent: [], skipped: 0, errors: [] })
+    expect(rpc.getProgramAccounts).not.toHaveBeenCalled()
+    expect(logCounts(logger)).toEqual([0, 1, 0])
+    expect(logger.warn).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ minLamports: ENV_FLOOR }))
+  })
+
+  it('createFinalizeJob finalizes once the payer holds the CRANK_MIN_SOL_LAMPORTS of its guards', async () => {
+    const { market, pools } = dueMarket()
+    const rpc = mockConnection({ markets: [market], pools, payerBalance: Number(ENV_FLOOR) })
+
+    const result = await createFinalizeJob(envGuards).run(contextFor(rpc.connection, 5))
+
+    expect(result).toEqual({ sent: [SIGNATURE], skipped: 0, errors: [] })
+  })
+
+  it('keeps the RPC URL and its key out of errors[] when reading the payer balance rejects', async () => {
+    const { market, pools } = dueMarket()
+    const rpc = mockConnection({ markets: [market], pools })
+    rpc.getBalance.mockRejectedValueOnce(new Error(`failed to get balance: request to ${KEYED_RPC_URL} failed`))
+
+    const result = await finalizeJob.run(contextFor(rpc.connection, 5))
+
+    expect(result.sent).toEqual([])
+    expect(result.errors).toHaveLength(1)
+    expect(result.errors.join('\n')).not.toContain(FAKE_API_KEY)
+    expect(rpc.getProgramAccounts).not.toHaveBeenCalled()
+  })
+
+  it('gives up on a payer balance read that does not answer within RPC_TIMEOUT_MS', async () => {
+    vi.useFakeTimers()
+    const { market, pools } = dueMarket()
+    const rpc = mockConnection({ markets: [market], pools })
+    rpc.getBalance.mockReturnValueOnce(new Promise<number>(() => undefined))
+
+    const pending = finalizeJob.run(contextFor(rpc.connection, 5))
+    await vi.advanceTimersByTimeAsync(RPC_TIMEOUT_MS)
+    const result = await pending
+
+    expect(result).toEqual({ sent: [], skipped: 0, errors: [expect.stringContaining('getBalance')] })
+    expect(rpc.getProgramAccounts).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
   })
 })

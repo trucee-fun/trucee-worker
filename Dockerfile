@@ -6,7 +6,8 @@
 # Runtime env (set on the container, never baked into the image):
 #   CLUSTER        devnet
 #   RPC_URL        upstream RPC (holds a provider key: SSM only)
-#   CRANK_KEYPAIR  crank signing key (SSM only)
+#   CRANK_KEYPAIR  crank signing key (SSM only): a path to a solana-keygen JSON keypair file, or the keypair
+#                  itself inline as its JSON array of 64 numbers, written like [1,2,...] with all 64 (the SSM form)
 
 # The worker runs on ECS Fargate arm64; the default keeps a build on an arm64 Mac native.
 ARG PLATFORM=linux/arm64

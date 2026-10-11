@@ -1,18 +1,19 @@
 /**
  * Worker entrypoint: validates config and the crank keypair, starts the crank loop with every job (CRK-07), stops it
  * on SIGINT/SIGTERM. Each tick runs finalize, migrate, claims and auto-exit in that order, so a graduated market can be
- * finalized, migrated and claimed in one tick (within MAX_TX_PER_TICK). Importing this module (tests) starts nothing
- * unless CRANK_FORCE_START=1.
+ * finalized, migrated and claimed in one tick (within MAX_TX_PER_TICK). Library output on stderr is scrubbed of the RPC
+ * URL like a log line (CRK-13). Importing this module (tests) starts nothing unless CRANK_FORCE_START=1.
  */
 import { existsSync, realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { format } from 'node:util'
 import { loadConfig, loadCrankKeypair, type WorkerConfig } from './config.js'
 import { startCrank, type CrankHandle, type CrankJob } from './crank/index.js'
 import { createAutoExitJob } from './crank/jobs/auto-exit.js'
 import { createClaimsJob } from './crank/jobs/claims.js'
-import { finalizeJob } from './crank/jobs/finalize.js'
+import { createFinalizeJob } from './crank/jobs/finalize.js'
 import { createMigrateJob } from './crank/jobs/migrate.js'
-import { errorMessage, log, registerSecret } from './log.js'
+import { errorMessage, log, redactUrls, registerSecret } from './log.js'
 
 /** worker/.env, if present. Variables already set in the shell take precedence over the file. */
 const ENV_FILE = fileURLToPath(new URL('../.env', import.meta.url))
@@ -28,14 +29,20 @@ const EXIT_OK = 0
 const EXIT_FAILURE = 1
 /** Set to "1" to start the worker when this module is not node's start script (e.g. loaded by another runner). */
 const FORCE_START_ENV = 'CRANK_FORCE_START'
+/** Shorter RPC URL parts are never scrubbed ("/", "v2", an empty query), as in log.ts registerSecret. */
+const MIN_SECRET_LENGTH = 8
+/** What a scrubbed RPC URL part becomes, as in log.ts. */
+const REDACTED = '[redacted]'
+
+type WriteCallback = (err?: Error | null) => void
 
 /**
  * The crank jobs in tick order, each spending within the guards of `cfg` (MIN_ATA_VALUE_LAMPORTS,
- * MAX_ATA_CREATES_PER_TICK, CRANK_MIN_SOL_LAMPORTS, MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS). finalize has no factory and
- * takes no guards: it creates no ATA and its only spend is the fee of each finalize, capped by MAX_TX_PER_TICK.
+ * MAX_ATA_CREATES_PER_TICK, CRANK_MIN_SOL_LAMPORTS, MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS). Every job stops at the
+ * CRANK_MIN_SOL_LAMPORTS payer floor; finalize creates no ATA and uses no other guard.
  */
 export function buildJobs(cfg: WorkerConfig): CrankJob[] {
-  return [finalizeJob, createMigrateJob({}, cfg), createClaimsJob(cfg), createAutoExitJob(cfg)]
+  return [createFinalizeJob(cfg), createMigrateJob({}, cfg), createClaimsJob(cfg), createAutoExitJob(cfg)]
 }
 
 function loadEnvFile(): void {
@@ -43,15 +50,60 @@ function loadEnvFile(): void {
 }
 
 /**
- * Registers the RPC URL and every part of it that could name the provider or carry its API key as log secrets: origin,
- * host, path and query, each path segment and each query value. An RPC error can quote the bare key without the URL
- * around it, and the logger reduces any URL in an error to its host, so the host is scrubbed too and never logged.
+ * The RPC URL and every part of it that could name the provider or carry its API key: origin, host, path and query,
+ * each path segment and each query value. Parts under 8 characters are left out. Longest first, so a whole part is
+ * replaced before any fragment of it.
  */
-export function protectRpcUrl(rpcUrl: string): void {
+function rpcUrlSecrets(rpcUrl: string): string[] {
   const url = new URL(rpcUrl)
   const parts = [rpcUrl, url.href, url.origin, url.host, url.hostname, url.pathname, url.search]
-  // registerSecret ignores values under 8 chars, so "/", "v2" or an empty query never become secrets.
-  for (const secret of [...parts, ...url.pathname.split('/'), ...url.searchParams.values()]) registerSecret(secret)
+  const all = [...parts, ...url.pathname.split('/'), ...url.searchParams.values()]
+  return [...new Set(all)].filter((part) => part.length >= MIN_SECRET_LENGTH).sort((a, b) => b.length - a.length)
+}
+
+/**
+ * Registers the RPC URL and every part of it that could name the provider or carry its API key as log secrets. An RPC
+ * error can quote the bare key without the URL around it, and the logger reduces any URL in an error to its host, so the
+ * host is scrubbed too and never logged.
+ */
+export function protectRpcUrl(rpcUrl: string): void {
+  for (const secret of rpcUrlSecrets(rpcUrl)) registerSecret(secret)
+}
+
+/** `text` with every URL reduced to its host, then every part of the RPC URL (its host among them) replaced. */
+function scrubText(text: string, secrets: readonly string[]): string {
+  return secrets.reduce((scrubbed, secret) => scrubbed.split(secret).join(REDACTED), redactUrls(text))
+}
+
+/**
+ * Scrubs every stderr line of the RPC URL, as the logger scrubs a log line: process.stderr.write, console.error and
+ * console.warn (which @solana/web3.js uses for connection and retry errors, and which can quote the URL with its key).
+ * Every URL is reduced to its host, then the RPC URL's host, key and other parts become [redacted]. A Buffer chunk is
+ * decoded as UTF-8. A URL split across two writes is not matched; console writes each line whole. Install it once at
+ * startup; the returned function puts the original writers back.
+ */
+export function scrubStderr(rpcUrl: string): () => void {
+  const secrets = rpcUrlSecrets(rpcUrl)
+  const scrub = (text: string): string => scrubText(text, secrets)
+  const stderr = process.stderr
+  const original = { write: stderr.write, error: console.error, warn: console.warn }
+
+  function write(chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | WriteCallback, callback?: WriteCallback): boolean {
+    const isText = typeof chunk === 'string'
+    const encoding = isText && typeof encodingOrCallback === 'string' ? encodingOrCallback : 'utf8'
+    const done = typeof encodingOrCallback === 'function' ? encodingOrCallback : callback
+    const text = isText ? chunk : Buffer.from(chunk).toString('utf8')
+    return original.write.call(stderr, scrub(text), encoding, done)
+  }
+
+  stderr.write = write as typeof stderr.write
+  console.error = (...data: unknown[]) => original.error.call(console, scrub(format(...data)))
+  console.warn = (...data: unknown[]) => original.warn.call(console, scrub(format(...data)))
+  return () => {
+    stderr.write = original.write
+    console.error = original.error
+    console.warn = original.warn
+  }
 }
 
 function exitOnFatal(kind: 'uncaughtException' | 'unhandledRejection'): (err: unknown) => void {
@@ -105,6 +157,7 @@ async function main(): Promise<void> {
   loadEnvFile()
   const cfg = loadConfig(process.env)
   protectRpcUrl(cfg.rpcUrl)
+  scrubStderr(cfg.rpcUrl)
   // Loaded here first so a bad keypair fails fast with a clear message before anything starts.
   const payer = loadCrankKeypair(cfg.crankKeypairPath)
   log.info('worker starting', { cluster: cfg.cluster, payer: payer.publicKey.toBase58() })

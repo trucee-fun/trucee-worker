@@ -3,6 +3,8 @@
  * and snapshots the buffer surplus that holders later claim, so no claim is possible until it lands.
  * A market is due while its Market account is unfinalized and its pool's migration_progress is not PreBondingCurve;
  * once finalize confirms, the market reads finalized and drops out of the plan.
+ *
+ * Guard (CRK-13, as CRK-10 for the other jobs): it plans nothing while the payer holds less than crankMinSolLamports.
  */
 import {
   TransactionMessage,
@@ -20,6 +22,7 @@ import {
   type ClusterConfig,
   type MarketAccount,
 } from '@trucee/sdk'
+import { defaultCrankGuards, type CrankGuards } from '../../config.js'
 import { errorMessage, redactUrls } from '../../log.js'
 import type { CrankContext, CrankJob, CrankJobResult } from '../index.js'
 
@@ -36,6 +39,8 @@ const POOL_BATCH_SIZE = 100
 const FINALIZE_MARKET_ACCOUNT_INDEX = 0
 /** Wall-clock bound on one confirmation, so a stalled RPC cannot hold the tick (and every later job) open. */
 export const CONFIRM_TIMEOUT_MS = 45_000
+/** Wall-clock bound on the payer balance read, as in the other crank jobs. */
+export const RPC_TIMEOUT_MS = 30_000
 const TIMED_OUT = Symbol('timed out')
 /**
  * Used only when the caller passes no cluster. Program ids are identical on every cluster in @trucee/sdk today;
@@ -212,8 +217,21 @@ async function sendFinalize(ctx: CrankContext, ixs: readonly TransactionInstruct
 
 /* ---------- job ---------- */
 
-async function runFinalize(ctx: CrankContext): Promise<CrankJobResult> {
+/** True when the payer holds at least `minLamports`; otherwise logs once and the job plans nothing this tick. */
+async function payerAboveFloor(ctx: CrankContext, minLamports: bigint): Promise<boolean> {
+  const read = await withTimeout(ctx.connection.getBalance(ctx.payer.publicKey, COMMITMENT), RPC_TIMEOUT_MS)
+  if (read === TIMED_OUT) throw new Error(`getBalance not answered within ${RPC_TIMEOUT_MS} ms`)
+  const balance = BigInt(read)
+  if (balance >= minLamports) return true
+  const fields = { job: JOB_NAME, payer: ctx.payer.publicKey.toBase58(), balanceLamports: balance, minLamports }
+  ctx.log.warn('finalize: crank payer balance below CRANK_MIN_SOL_LAMPORTS; nothing planned this tick', fields)
+  return false
+}
+
+async function runFinalize(ctx: CrankContext, configured: CrankGuards | undefined): Promise<CrankJobResult> {
   const cluster = ctx.cluster
+  const guards = configured ?? defaultCrankGuards(cluster.cluster)
+  if (!(await payerAboveFloor(ctx, guards.crankMinSolLamports))) return { sent: [], skipped: 0, errors: [] }
   const markets = await fetchAllMarkets(ctx.connection, cluster.routerProgramId)
   const open = markets.filter((market) => !market.finalized)
   const poolProgress = await fetchPoolProgress(ctx, cluster, open)
@@ -232,17 +250,26 @@ async function runFinalize(ctx: CrankContext): Promise<CrankJobResult> {
   }
 }
 
-/** Sends `finalize` (simulated first) for every complete, unfinalized market, at most ctx.maxTx per tick. */
-export const finalizeJob: CrankJob = Object.freeze({
-  name: JOB_NAME,
-  async run(ctx: CrankContext): Promise<CrankJobResult> {
-    try {
-      return await runFinalize(ctx)
-    } catch (err) {
-      // Redacted like failure(): errors[] may embed the RPC URL and its key.
-      const error = redactUrls(errorMessage(err))
-      ctx.log.error('finalize job failed', { job: JOB_NAME, error })
-      return { sent: [], skipped: 0, errors: [error] }
-    }
-  },
-})
+/**
+ * Sends `finalize` (simulated first) for every complete, unfinalized market, at most ctx.maxTx per tick, while the payer
+ * holds at least the guards' crankMinSolLamports. Without `guards` it uses defaultCrankGuards for ctx.cluster; the
+ * worker passes its WorkerConfig. Never throws.
+ */
+export function createFinalizeJob(guards?: CrankGuards): CrankJob {
+  return Object.freeze({
+    name: JOB_NAME,
+    async run(ctx: CrankContext): Promise<CrankJobResult> {
+      try {
+        return await runFinalize(ctx, guards)
+      } catch (err) {
+        // Redacted like failure(): errors[] may embed the RPC URL and its key.
+        const error = redactUrls(errorMessage(err))
+        ctx.log.error('finalize job failed', { job: JOB_NAME, error })
+        return { sent: [], skipped: 0, errors: [error] }
+      }
+    },
+  })
+}
+
+/** The finalize job with the default guards of ctx.cluster. */
+export const finalizeJob: CrankJob = createFinalizeJob()

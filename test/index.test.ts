@@ -1,6 +1,7 @@
 /**
  * CRK-07: the worker entrypoint registers every crank job, in tick order, with the guards of its env config; it never
  * exits as a silent no-op when started; and it scrubs every part of the RPC URL that could carry the API key.
+ * CRK-13: finalize gets the env guards too, and library output on stderr is scrubbed like a log line.
  */
 import { execFile } from 'node:child_process'
 import { dirname, join, resolve } from 'node:path'
@@ -9,14 +10,18 @@ import { Keypair, type Connection } from '@solana/web3.js'
 import { getClusterConfig } from '@trucee/sdk'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DEFAULT_CRANK_MIN_SOL_LAMPORTS, DEFAULT_MIN_ATA_VALUE_LAMPORTS, loadConfig, type WorkerConfig } from '../src/config.js'
-import type { CrankContext, CrankJob } from '../src/crank/index.js'
+import type { CrankContext } from '../src/crank/index.js'
 import { createAutoExitJob } from '../src/crank/jobs/auto-exit.js'
 import { createClaimsJob } from '../src/crank/jobs/claims.js'
-import { finalizeJob } from '../src/crank/jobs/finalize.js'
+import { createFinalizeJob } from '../src/crank/jobs/finalize.js'
 import { createMigrateJob } from '../src/crank/jobs/migrate.js'
 import { log, type Logger } from '../src/log.js'
-import { buildJobs, protectRpcUrl, shouldStartWorker } from '../src/index.js'
+import { buildJobs, protectRpcUrl, scrubStderr, shouldStartWorker } from '../src/index.js'
 
+vi.mock('../src/crank/jobs/finalize.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/crank/jobs/finalize.js')>()
+  return { ...actual, createFinalizeJob: vi.fn(actual.createFinalizeJob) }
+})
 vi.mock('../src/crank/jobs/claims.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/crank/jobs/claims.js')>()
   return { ...actual, createClaimsJob: vi.fn(actual.createClaimsJob) }
@@ -33,7 +38,6 @@ vi.mock('../src/crank/jobs/auto-exit.js', async (importOriginal) => {
 const ENV_MIN_ATA_VALUE_LAMPORTS = 123_456_789n
 const ENV_CRANK_MIN_SOL_LAMPORTS = 987_654_321n
 const JOB_ORDER = ['finalize', 'migrate', 'claims', 'auto-exit']
-const GUARDED_JOBS = ['migrate', 'claims', 'auto-exit']
 
 /** The worker config read from process.env, with both guards set to non-default values. */
 function configFromEnv(): WorkerConfig {
@@ -65,10 +69,6 @@ function contextWithBalance(balance: bigint): { ctx: CrankContext; getProgramAcc
   return { ctx, getProgramAccounts, log }
 }
 
-function guarded(jobs: readonly CrankJob[]): CrankJob[] {
-  return jobs.filter((job) => GUARDED_JOBS.includes(job.name))
-}
-
 afterEach(() => {
   vi.unstubAllEnvs()
   vi.clearAllMocks()
@@ -79,10 +79,9 @@ describe('buildJobs', () => {
     const jobs = buildJobs(configFromEnv())
 
     expect(jobs.map((job) => job.name)).toEqual(JOB_ORDER)
-    expect(jobs[0]).toBe(finalizeJob)
   })
 
-  it('builds migrate, claims and auto-exit from the cfg-aware factories with MIN_ATA_VALUE_LAMPORTS and CRANK_MIN_SOL_LAMPORTS from the env', () => {
+  it('builds every job from its cfg-aware factory with MIN_ATA_VALUE_LAMPORTS and CRANK_MIN_SOL_LAMPORTS from the env', () => {
     const cfg = configFromEnv()
     expect(ENV_MIN_ATA_VALUE_LAMPORTS).not.toBe(DEFAULT_MIN_ATA_VALUE_LAMPORTS)
     expect(ENV_CRANK_MIN_SOL_LAMPORTS).not.toBe(DEFAULT_CRANK_MIN_SOL_LAMPORTS)
@@ -93,6 +92,8 @@ describe('buildJobs', () => {
 
     buildJobs(cfg)
 
+    expect(createFinalizeJob).toHaveBeenCalledTimes(1)
+    expect(createFinalizeJob).toHaveBeenCalledWith(envGuards)
     expect(createMigrateJob).toHaveBeenCalledTimes(1)
     expect(createMigrateJob).toHaveBeenCalledWith({}, envGuards)
     expect(createClaimsJob).toHaveBeenCalledTimes(1)
@@ -101,18 +102,21 @@ describe('buildJobs', () => {
     expect(createAutoExitJob).toHaveBeenCalledWith(envGuards)
   })
 
-  it('every guarded job plans nothing while the payer holds less than CRANK_MIN_SOL_LAMPORTS from the env', async () => {
+  it('every job plans nothing while the payer holds less than CRANK_MIN_SOL_LAMPORTS from the env', async () => {
     // Above the 0.05 SOL default floor, below the env floor: only the env value can stop the scans.
     const balance = ENV_CRANK_MIN_SOL_LAMPORTS - 1n
     expect(balance).toBeGreaterThan(DEFAULT_CRANK_MIN_SOL_LAMPORTS)
+    const jobs = buildJobs(configFromEnv())
+    expect(jobs.map((job) => job.name)).toEqual(JOB_ORDER)
 
-    for (const job of guarded(buildJobs(configFromEnv()))) {
+    for (const job of jobs) {
       const { ctx, getProgramAccounts, log } = contextWithBalance(balance)
 
       const result = await job.run(ctx)
 
       expect(result, job.name).toEqual({ sent: [], skipped: 0, errors: [] })
       expect(getProgramAccounts, job.name).not.toHaveBeenCalled()
+      expect(log.warn, job.name).toHaveBeenCalledTimes(1)
       expect(log.warn, job.name).toHaveBeenCalledWith(
         expect.stringContaining('CRANK_MIN_SOL_LAMPORTS'),
         expect.objectContaining({ minLamports: ENV_CRANK_MIN_SOL_LAMPORTS }),
@@ -120,8 +124,8 @@ describe('buildJobs', () => {
     }
   })
 
-  it('every guarded job scans the chain once the payer holds CRANK_MIN_SOL_LAMPORTS from the env', async () => {
-    for (const job of guarded(buildJobs(configFromEnv()))) {
+  it('every job scans the chain once the payer holds CRANK_MIN_SOL_LAMPORTS from the env', async () => {
+    for (const job of buildJobs(configFromEnv())) {
       const { ctx, getProgramAccounts } = contextWithBalance(ENV_CRANK_MIN_SOL_LAMPORTS)
 
       await job.run(ctx)
@@ -130,6 +134,11 @@ describe('buildJobs', () => {
     }
   })
 })
+
+/** An RPC URL whose path carries the key, as a library would quote it on a connection error. */
+const STDERR_HOST = 'x.invalid'
+const STDERR_SECRET = 'SECRETKEY'
+const STDERR_RPC_URL = `https://${STDERR_HOST}/v2/${STDERR_SECRET}`
 
 const WORKER_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const INDEX_PATH = join(WORKER_DIR, 'src', 'index.ts')
@@ -175,6 +184,22 @@ describe('worker start', () => {
     const run = await runNode(IMPORT_INDEX, { CLUSTER: 'bogus' })
 
     expect(run).toEqual({ code: 0, output: '' })
+  }, SPAWN_TIMEOUT_MS)
+
+  it('main() scrubs stderr once the config loads: a library line quoting the RPC URL keeps neither its key nor its host', async () => {
+    // A missing keypair stops main() after the scrub is installed and before anything touches the network.
+    const libraryWrites = `process.stderr.write('lib error ${STDERR_RPC_URL}\\n'); console.error('ws error:', '${STDERR_RPC_URL}')`
+    const script = ['--import', 'tsx', '--input-type=module', '-e', `await import('./src/index.ts'); ${libraryWrites}`]
+    const env = { CLUSTER: 'devnet', RPC_URL: STDERR_RPC_URL, CRANK_KEYPAIR: './no-such-keypair.json', CRANK_FORCE_START: '1' }
+
+    const run = await runNode(script, env)
+
+    expect(run.code).not.toBe(0)
+    expect(run.output).toContain('worker failed to start')
+    expect(run.output).toContain('lib error [redacted]')
+    expect(run.output).toContain('ws error: [redacted]')
+    expect(run.output).not.toContain(STDERR_SECRET)
+    expect(run.output).not.toContain(STDERR_HOST)
   }, SPAWN_TIMEOUT_MS)
 })
 
@@ -253,5 +278,82 @@ describe('protectRpcUrl', () => {
     expect(output).not.toContain(PATH_KEY)
     expect(output).not.toContain('rpc.example.com')
     expect(output).toContain('invalid api-key [redacted]')
+  })
+})
+
+/** Replaces process.stderr.write, console.error and console.warn with recorders of what each is handed. */
+function recordStderr(): { readonly chunks: string[]; readonly restore: () => void } {
+  const chunks: string[] = []
+  const text = (chunk: string | Uint8Array): string => (typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'))
+  const spies = [
+    vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      chunks.push(text(chunk))
+      return true
+    }),
+    vi.spyOn(console, 'error').mockImplementation((...data: unknown[]) => {
+      chunks.push(data.map(String).join(' '))
+    }),
+    vi.spyOn(console, 'warn').mockImplementation((...data: unknown[]) => {
+      chunks.push(data.map(String).join(' '))
+    }),
+  ]
+  return { chunks, restore: () => spies.forEach((spy) => spy.mockRestore()) }
+}
+
+describe('scrubStderr', () => {
+  /** Undoes, in order, the scrubber and then the recorders under it, so no wrapper outlives its test. */
+  let undo: ReadonlyArray<() => void> = []
+
+  /** Records stderr, then installs the scrubber over the recorders for STDERR_RPC_URL. */
+  function scrubbedStderr(): string[] {
+    const recorder = recordStderr()
+    const unscrub = scrubStderr(STDERR_RPC_URL)
+    undo = [unscrub, recorder.restore]
+    return recorder.chunks
+  }
+
+  afterEach(() => {
+    for (const fn of undo) fn()
+    undo = []
+  })
+
+  it('a library writing the RPC URL to stderr: the line written contains neither the key nor the host', () => {
+    const chunks = scrubbedStderr()
+
+    process.stderr.write(`request to ${STDERR_RPC_URL} failed\n`)
+
+    expect(chunks).toEqual(['request to [redacted] failed\n'])
+  })
+
+  it('scrubs a bare key and a Buffer chunk, and keeps the host of any other URL, as the logger does', () => {
+    const chunks = scrubbedStderr()
+
+    process.stderr.write(Buffer.from(`invalid api key ${STDERR_SECRET}\n`))
+    process.stderr.write('see https://docs.example.org/errors/429?ref=abc\n', 'utf8')
+
+    expect(chunks).toEqual(['invalid api key [redacted]\n', 'see docs.example.org\n'])
+  })
+
+  it('scrubs console.error and console.warn, which @solana/web3.js uses for connection and retry errors', () => {
+    const chunks = scrubbedStderr()
+
+    console.error('ws error:', `connect ECONNREFUSED ${STDERR_RPC_URL}`)
+    console.warn(new Error(`fetch failed: ${STDERR_RPC_URL}`))
+
+    const output = chunks.join('\n')
+    expect(chunks[0]).toBe('ws error: connect ECONNREFUSED [redacted]')
+    expect(output).toContain('fetch failed: [redacted]')
+    expect(output).not.toContain(STDERR_SECRET)
+    expect(output).not.toContain(STDERR_HOST)
+  })
+
+  it('restores the original stderr writers', () => {
+    const recorder = recordStderr()
+    undo = [recorder.restore]
+    const originals = [process.stderr.write, console.error, console.warn]
+
+    scrubStderr(STDERR_RPC_URL)()
+
+    expect([process.stderr.write, console.error, console.warn]).toEqual(originals)
   })
 })
