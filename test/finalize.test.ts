@@ -9,7 +9,7 @@ import {
 } from '@trucee/sdk'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { CrankContext } from '../src/crank/index.js'
-import { finalizeJob, planFinalize } from '../src/crank/jobs/finalize.js'
+import { CONFIRM_TIMEOUT_MS, finalizeJob, planFinalize } from '../src/crank/jobs/finalize.js'
 import type { Logger } from '../src/log.js'
 
 const LOCAL_RPC_URL = 'http://127.0.0.1:8899'
@@ -37,6 +37,9 @@ const ALREADY_FINALIZED_LOGS = [
   `Program ${ROUTER_PROGRAM_ID.toBase58()} failed: custom program error: 0x177a`,
 ]
 const ALREADY_FINALIZED_ERR: TransactionError = { InstructionError: [0, { Custom: 6010 }] }
+/** A fake provider key inside an RPC URL, as raw web3.js errors embed it. */
+const FAKE_API_KEY = 'fake-api-key-0123456789'
+const KEYED_RPC_URL = `https://rpc.example.invalid/v1/?api-key=${FAKE_API_KEY}`
 
 const randomKey = (): PublicKey => Keypair.generate().publicKey
 
@@ -90,6 +93,8 @@ interface ChainState {
   readonly pools: ReadonlyMap<string, Buffer | null>
   readonly simulationErr?: TransactionError | null
   readonly simulationLogs?: string[]
+  /** Owner of every pool account; defaults to the cluster's DBC program. */
+  readonly poolOwner?: PublicKey
 }
 
 /** A real Connection whose RPC methods are all stubbed, so nothing touches the network. */
@@ -106,7 +111,7 @@ function mockConnection(state: ChainState) {
     .mockImplementation(async (keys: PublicKey[]) =>
       keys.map((key) => {
         const data = state.pools.get(key.toBase58())
-        return data === undefined || data === null ? null : accountInfo(data, CLUSTER.dbcProgramId)
+        return data === undefined || data === null ? null : accountInfo(data, state.poolOwner ?? CLUSTER.dbcProgramId)
       }),
     )
   const getLatestBlockhash = vi
@@ -146,6 +151,7 @@ function dueMarket(): { market: MarketAccount; pools: Map<string, Buffer | null>
 }
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.restoreAllMocks()
 })
 
@@ -344,6 +350,22 @@ describe('finalizeJob', () => {
     expect(logger.warn).toHaveBeenCalled()
   })
 
+  it('skips and logs a market whose pool account is not owned by the DBC program', async () => {
+    const { market, pools } = dueMarket()
+    const owner = randomKey()
+    const rpc = mockConnection({ markets: [market], pools, poolOwner: owner })
+    const logger = silentLogger()
+
+    const result = await finalizeJob.run(contextFor(rpc.connection, 5, logger))
+
+    expect(result).toEqual({ sent: [], skipped: 1, errors: [] })
+    expect(rpc.simulateTransaction).not.toHaveBeenCalled()
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('not owned by DBC'),
+      expect.objectContaining({ pool: market.pool.toBase58(), owner: owner.toBase58() }),
+    )
+  })
+
   it('fetches pool accounts in batches of 100', async () => {
     const markets = Array.from({ length: POOL_BATCH_SIZE + 50 }, () => makeMarket())
     const pools = new Map(markets.map((market) => [market.pool.toBase58(), poolData(PROGRESS_PRE_BONDING)]))
@@ -401,6 +423,64 @@ describe('finalizeJob', () => {
 
     expect(result.sent).toEqual([])
     expect(result.errors).toEqual([expect.stringContaining('429')])
+  })
+
+  it('keeps the RPC URL and its key out of errors[] when sending rejects', async () => {
+    const { market, pools } = dueMarket()
+    const rpc = mockConnection({ markets: [market], pools })
+    rpc.sendRawTransaction.mockRejectedValueOnce(new Error(`failed to send transaction: request to ${KEYED_RPC_URL} failed`))
+
+    const result = await finalizeJob.run(contextFor(rpc.connection, 5))
+
+    expect(result.errors).toHaveLength(1)
+    expect(result.errors[0]).toContain('rpc.example.invalid')
+    expect(result.errors.join('\n')).not.toContain(FAKE_API_KEY)
+    expect(result.errors.join('\n')).not.toContain(KEYED_RPC_URL)
+  })
+
+  it('keeps the RPC URL and its key out of errors[] when fetching markets rejects', async () => {
+    const rpc = mockConnection({ markets: [], pools: new Map() })
+    rpc.getProgramAccounts.mockRejectedValueOnce(new Error(`failed to get accounts from ${KEYED_RPC_URL}`))
+
+    const result = await finalizeJob.run(contextFor(rpc.connection, 5))
+
+    expect(result.errors).toHaveLength(1)
+    expect(result.errors.join('\n')).not.toContain(FAKE_API_KEY)
+  })
+
+  it('reports an unknown outcome and does not resend when confirmation outlasts the timeout', async () => {
+    vi.useFakeTimers()
+    const { market, pools } = dueMarket()
+    const rpc = mockConnection({ markets: [market], pools })
+    // Confirmation stalls past the timeout, then rejects: that late rejection must stay handled.
+    const lateRejection = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('block height exceeded')), CONFIRM_TIMEOUT_MS * 2)
+    })
+    rpc.confirmTransaction.mockReturnValueOnce(lateRejection)
+    const logger = silentLogger()
+
+    const pending = finalizeJob.run(contextFor(rpc.connection, 5, logger))
+    await vi.advanceTimersByTimeAsync(CONFIRM_TIMEOUT_MS)
+    const result = await pending
+    await vi.advanceTimersByTimeAsync(CONFIRM_TIMEOUT_MS)
+
+    expect(result.sent).toEqual([])
+    expect(result.errors).toEqual([expect.stringContaining('outcome unknown')])
+    expect(result.errors[0]).toContain(market.address.toBase58())
+    expect(rpc.sendRawTransaction).toHaveBeenCalledTimes(1)
+    expect(logger.warn).toHaveBeenCalledWith('finalize outcome unknown, will re-check next tick', expect.anything())
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('clears the confirmation timer when confirmation settles in time', async () => {
+    vi.useFakeTimers()
+    const { market, pools } = dueMarket()
+    const rpc = mockConnection({ markets: [market], pools })
+
+    const result = await finalizeJob.run(contextFor(rpc.connection, 5))
+
+    expect(result.sent).toEqual([SIGNATURE])
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   it('does not throw when ctx.cluster cannot be resolved', async () => {

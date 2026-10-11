@@ -20,7 +20,7 @@ import {
   type ClusterConfig,
   type MarketAccount,
 } from '@trucee/sdk'
-import { errorMessage } from '../../log.js'
+import { errorMessage, redactUrls } from '../../log.js'
 import type { CrankContext, CrankJob, CrankJobResult } from '../index.js'
 
 const JOB_NAME = 'finalize'
@@ -34,6 +34,9 @@ const PRE_BONDING_CURVE = 0
 const POOL_BATCH_SIZE = 100
 /** finalizeInstruction puts the market first: [market (w), pool, buffer_vault]. */
 const FINALIZE_MARKET_ACCOUNT_INDEX = 0
+/** Wall-clock bound on one confirmation, so a stalled RPC cannot hold the tick (and every later job) open. */
+export const CONFIRM_TIMEOUT_MS = 45_000
+const TIMED_OUT = Symbol('timed out')
 /**
  * Used only when the caller passes no cluster. Program ids are identical on every cluster in @trucee/sdk today;
  * run() always passes ctx.cluster, so a future per-cluster router id is picked up there.
@@ -53,8 +56,14 @@ function isDue(market: MarketAccount, poolProgress: ReadonlyMap<string, number>)
 }
 
 /**
- * One single-instruction transaction per market that is not finalized and whose pool progress (keyed by pool
- * base58) is known and not PreBondingCurve, in input order. Markets with no progress entry are left out.
+ * One single-instruction transaction per market that is not finalized and whose pool progress is known and not
+ * PreBondingCurve, in input order. Markets with no progress entry are left out.
+ *
+ * @param markets decoded router Market accounts
+ * @param poolProgress DBC migration_progress by pool address (base58)
+ * @param cluster cluster whose router program the instructions target. Optional: it defaults to devnet, whose
+ *   program ids every SDK cluster shares today. finalizeJob.run() always passes ctx.cluster, so pass it explicitly
+ *   whenever the cluster is known.
  */
 export function planFinalize(
   markets: readonly MarketAccount[],
@@ -74,11 +83,20 @@ function chunk<T>(items: readonly T[], size: number): T[][] {
   return Array.from({ length: Math.ceil(items.length / size) }, (_, i) => items.slice(i * size, (i + 1) * size))
 }
 
-/** migration_progress of one pool, or null (logged) when the account is missing or too short to hold it. */
-function readProgress(ctx: CrankContext, market: MarketAccount, info: AccountInfo<Buffer> | null): number | null {
+/** migration_progress of one pool, or null (logged) when the account is missing, not a DBC account, or too short. */
+function readProgress(
+  ctx: CrankContext,
+  cluster: ClusterConfig,
+  market: MarketAccount,
+  info: AccountInfo<Buffer> | null,
+): number | null {
   const fields = { job: JOB_NAME, market: market.address.toBase58(), pool: market.pool.toBase58() }
   if (info === null) {
     ctx.log.warn('finalize: pool account missing; market skipped', fields)
+    return null
+  }
+  if (!info.owner.equals(cluster.dbcProgramId)) {
+    ctx.log.warn('finalize: pool account not owned by DBC; market skipped', { ...fields, owner: info.owner.toBase58() })
     return null
   }
   if (info.data.length < POOL_MIN_LENGTH) {
@@ -89,7 +107,11 @@ function readProgress(ctx: CrankContext, market: MarketAccount, info: AccountInf
 }
 
 /** Pool migration_progress by pool base58 for `markets`, read in batches; unreadable pools are absent. */
-async function fetchPoolProgress(ctx: CrankContext, markets: readonly MarketAccount[]): Promise<Map<string, number>> {
+async function fetchPoolProgress(
+  ctx: CrankContext,
+  cluster: ClusterConfig,
+  markets: readonly MarketAccount[],
+): Promise<Map<string, number>> {
   let entries: ReadonlyArray<readonly [string, number]> = []
   for (const batch of chunk(markets, POOL_BATCH_SIZE)) {
     const infos = await ctx.connection.getMultipleAccountsInfo(
@@ -97,7 +119,7 @@ async function fetchPoolProgress(ctx: CrankContext, markets: readonly MarketAcco
       COMMITMENT,
     )
     const read = batch.flatMap((market, i): Array<readonly [string, number]> => {
-      const progress = readProgress(ctx, market, infos[i] ?? null)
+      const progress = readProgress(ctx, cluster, market, infos[i] ?? null)
       return progress === null ? [] : [[market.pool.toBase58(), progress]]
     })
     entries = [...entries, ...read]
@@ -127,12 +149,37 @@ function buildTransaction(payer: Keypair, ixs: readonly TransactionInstruction[]
   return tx
 }
 
-function failure(ctx: CrankContext, market: string, reason: string): SendOutcome {
-  ctx.log.warn('finalize: market skipped', { job: JOB_NAME, market, reason })
-  return { ok: false, error: `${market}: ${reason}` }
+/**
+ * Settles with `promise`, or with TIMED_OUT after `ms`. The timer is always cleared. A later rejection of `promise`
+ * stays handled, because Promise.race keeps its subscription.
+ */
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  let timer: NodeJS.Timeout | undefined
+  const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), ms)
+  })
+  try {
+    return await Promise.race([promise, timeout])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
-/** Simulates, then sends and confirms one finalize transaction. Never throws. */
+/**
+ * Logs and returns a failed outcome. Raw RPC errors can embed the RPC URL with its API key, and errors[] leaves the
+ * job without passing through the logger, so URLs are reduced to their host here.
+ */
+function failure(ctx: CrankContext, market: string, reason: string, msg = 'finalize: market skipped'): SendOutcome {
+  const error = redactUrls(`${market}: ${reason}`)
+  ctx.log.warn(msg, { job: JOB_NAME, market, reason })
+  return { ok: false, error }
+}
+
+/**
+ * Simulates, then sends and confirms one finalize transaction. Never throws. A confirmation that outlasts
+ * CONFIRM_TIMEOUT_MS is reported as an unknown outcome and not resent this tick: if it landed, next tick's
+ * simulation fails with AlreadyFinalized; if not, next tick sends it again.
+ */
 async function sendFinalize(ctx: CrankContext, ixs: readonly TransactionInstruction[]): Promise<SendOutcome> {
   const market = marketLabel(ixs)
   try {
@@ -145,10 +192,14 @@ async function sendFinalize(ctx: CrankContext, ixs: readonly TransactionInstruct
     }
     // Preflight would repeat the simulation that just passed.
     const signature = await ctx.connection.sendRawTransaction(tx.serialize(), { skipPreflight: true })
-    const confirmation = await ctx.connection.confirmTransaction(
-      { signature, blockhash, lastValidBlockHeight },
-      COMMITMENT,
+    const confirmation = await withTimeout(
+      ctx.connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, COMMITMENT),
+      CONFIRM_TIMEOUT_MS,
     )
+    if (confirmation === TIMED_OUT) {
+      const reason = `transaction ${signature} not confirmed within ${CONFIRM_TIMEOUT_MS} ms; outcome unknown, will re-check next tick`
+      return failure(ctx, market, reason, 'finalize outcome unknown, will re-check next tick')
+    }
     if (confirmation.value.err !== null) {
       return failure(ctx, market, `transaction ${signature} failed: ${describeTxError(confirmation.value.err, null)}`)
     }
@@ -165,7 +216,7 @@ async function runFinalize(ctx: CrankContext): Promise<CrankJobResult> {
   const cluster = ctx.cluster
   const markets = await fetchAllMarkets(ctx.connection, cluster.routerProgramId)
   const open = markets.filter((market) => !market.finalized)
-  const poolProgress = await fetchPoolProgress(ctx, open)
+  const poolProgress = await fetchPoolProgress(ctx, cluster, open)
   const unreadable = open.filter((market) => !poolProgress.has(market.pool.toBase58())).length
 
   const plan = planFinalize(open, poolProgress, cluster)
@@ -188,7 +239,8 @@ export const finalizeJob: CrankJob = Object.freeze({
     try {
       return await runFinalize(ctx)
     } catch (err) {
-      const error = errorMessage(err)
+      // Redacted like failure(): errors[] may embed the RPC URL and its key.
+      const error = redactUrls(errorMessage(err))
       ctx.log.error('finalize job failed', { job: JOB_NAME, error })
       return { sent: [], skipped: 0, errors: [error] }
     }
