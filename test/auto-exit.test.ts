@@ -1,0 +1,618 @@
+/**
+ * CRK-05: the auto-exit crank job. planAutoExits is tested with synthetic decoded accounts; autoExitJob.run with an
+ * in-memory Connection fake that serves raw account bytes (Position, Market, DBC pool, Clock sysvar).
+ */
+import { Buffer } from 'node:buffer'
+import {
+  Keypair,
+  PublicKey,
+  SYSVAR_CLOCK_PUBKEY,
+  SystemProgram,
+  type Connection,
+  type TransactionError,
+  type TransactionInstruction,
+  type VersionedTransaction,
+} from '@solana/web3.js'
+import {
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  createAssociatedTokenAccountIdempotentInstruction,
+  getAssociatedTokenAddressSync,
+} from '@solana/spl-token'
+import {
+  DBC_PROGRAM_ID,
+  ROUTER_PROGRAM_ID,
+  autoExitInstruction,
+  decodeMarket,
+  decodePosition,
+  findBufferPda,
+  findMarketPda,
+  findPositionPda,
+  getClusterConfig,
+  marketAccountsFor,
+  type MarketAccount,
+  type PositionAccount,
+  type QuoteMintInfo,
+} from '@trucee/sdk'
+import { describe, expect, it, vi } from 'vitest'
+import type { CrankContext } from '../src/crank/index.js'
+import { autoExitJob, planAutoExits } from '../src/crank/jobs/auto-exit.js'
+
+const cluster = getClusterConfig('localnet')
+const NOW = 1_800_000_000n
+const TOKENS = 5_000_000n
+const BASIS = 100_000_000n
+const LIVE = 0
+/** DBC MigrationProgress: PostBondingCurve, LockedVesting, CreatedPool. */
+const COMPLETE_STAGES = [1, 2, 3] as const
+
+function quoteBy(symbol: QuoteMintInfo['symbol']): QuoteMintInfo {
+  const quote = cluster.quoteMints.find((q) => q.symbol === symbol)
+  if (quote === undefined) throw new Error(`no ${symbol} quote on localnet`)
+  return quote
+}
+
+const SOL = quoteBy('SOL')
+const TSLAX = quoteBy('TSLAx')
+
+const randomKey = (): PublicKey => Keypair.generate().publicKey
+
+function makeMarket(quote: QuoteMintInfo = SOL, overrides: Partial<MarketAccount> = {}): MarketAccount {
+  const pool = randomKey()
+  const address = findMarketPda(pool)
+  return Object.freeze({
+    address,
+    pool,
+    config: randomKey(),
+    baseMint: randomKey(),
+    quoteMint: quote.mint,
+    baseVault: randomKey(),
+    quoteVault: randomKey(),
+    bufferVault: findBufferPda(address),
+    feeNumerator: 10_000_000n,
+    bump: 255,
+    totalBasis: BASIS,
+    finalized: false,
+    surplusSnapshot: 0n,
+    basisSnapshot: 0n,
+    surplusClaimed: 0n,
+    ...overrides,
+  })
+}
+
+function makePosition(market: MarketAccount, overrides: Partial<PositionAccount> = {}): PositionAccount {
+  const owner = overrides.owner ?? randomKey()
+  return Object.freeze({
+    address: findPositionPda(market.address, owner),
+    owner,
+    market: market.address,
+    tokens: TOKENS,
+    basis: BASIS,
+    bump: 254,
+    autoExitDeadline: NOW - 60n,
+    ...overrides,
+  })
+}
+
+interface Scenario {
+  readonly positions: PositionAccount[]
+  readonly markets: Map<string, MarketAccount>
+  readonly poolProgress: Map<string, number>
+}
+
+function scenario(entries: readonly { market: MarketAccount; position: PositionAccount; progress?: number }[]): Scenario {
+  return {
+    positions: entries.map((e) => e.position),
+    markets: new Map(entries.map((e) => [e.market.address.toBase58(), e.market])),
+    poolProgress: new Map(entries.map((e) => [e.market.pool.toBase58(), e.progress ?? LIVE])),
+  }
+}
+
+function plan(s: Scenario, payer: PublicKey, now: bigint = NOW): TransactionInstruction[][] {
+  return planAutoExits(s.positions, s.markets, s.poolProgress, now, payer)
+}
+
+const normalize = (ix: TransactionInstruction) => ({
+  programId: ix.programId.toBase58(),
+  keys: ix.keys.map((k) => ({ pubkey: k.pubkey.toBase58(), isSigner: k.isSigner, isWritable: k.isWritable })),
+  data: Buffer.from(ix.data).toString('hex'),
+})
+
+function expectedExit(market: MarketAccount, quote: QuoteMintInfo, owner: PublicKey, payer: PublicKey): TransactionInstruction[] {
+  const ownerQuote = getAssociatedTokenAddressSync(quote.mint, owner, false, quote.tokenProgram)
+  return [
+    createAssociatedTokenAccountIdempotentInstruction(payer, ownerQuote, owner, quote.mint, quote.tokenProgram),
+    autoExitInstruction({ cluster, accounts: marketAccountsFor(market, quote.tokenProgram), cranker: payer, owner }),
+  ]
+}
+
+describe('planAutoExits', () => {
+  const payer = randomKey()
+
+  it('skips a position whose deadline is 0 (Auto-Exit disabled)', () => {
+    const market = makeMarket()
+    const s = scenario([{ market, position: makePosition(market, { autoExitDeadline: 0n }) }])
+
+    expect(plan(s, payer)).toEqual([])
+  })
+
+  it('skips a position in the old 89-byte layout (no deadline field)', () => {
+    const market = makeMarket()
+    const s = scenario([{ market, position: makePosition(market, { autoExitDeadline: null }) }])
+
+    expect(plan(s, payer)).toEqual([])
+  })
+
+  it('skips a deadline still in the future of the chain clock', () => {
+    const market = makeMarket()
+    const s = scenario([{ market, position: makePosition(market, { autoExitDeadline: NOW + 1n }) }])
+
+    expect(plan(s, payer)).toEqual([])
+  })
+
+  it('treats a deadline equal to now as due, like the router (now >= deadline)', () => {
+    const market = makeMarket()
+    const s = scenario([{ market, position: makePosition(market, { autoExitDeadline: NOW }) }])
+
+    expect(plan(s, payer)).toHaveLength(1)
+  })
+
+  it('gives one transaction for a due deadline on a live curve: create quote ATA, then auto_exit', () => {
+    const market = makeMarket()
+    const position = makePosition(market)
+    const s = scenario([{ market, position }])
+
+    const txs = plan(s, payer)
+
+    expect(txs).toHaveLength(1)
+    expect(txs[0]?.map(normalize)).toEqual(expectedExit(market, SOL, position.owner, payer).map(normalize))
+  })
+
+  it.each(COMPLETE_STAGES)('skips a due deadline on a complete curve (migration progress %i)', (progress) => {
+    const market = makeMarket()
+    const s = scenario([{ market, position: makePosition(market), progress }])
+
+    expect(plan(s, payer)).toEqual([])
+  })
+
+  it('skips a position with 0 tokens', () => {
+    const market = makeMarket()
+    const s = scenario([{ market, position: makePosition(market, { tokens: 0n }) }])
+
+    expect(plan(s, payer)).toEqual([])
+  })
+
+  it("creates the owner's missing quote ATA, paid by the crank payer, before auto_exit refunds into it", () => {
+    const market = makeMarket(SOL)
+    const owner = randomKey() // a fresh owner: no quote ATA exists for it
+    const position = makePosition(market, { owner })
+    const ownerQuote = getAssociatedTokenAddressSync(SOL.mint, owner, false, TOKEN_PROGRAM_ID)
+
+    const [createAta, exit] = plan(scenario([{ market, position }]), payer)[0] ?? []
+
+    expect(createAta?.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID)).toBe(true)
+    expect(Buffer.from(createAta?.data ?? []).toString('hex')).toBe('01') // CreateIdempotent
+    expect(normalize(createAta!).keys).toEqual([
+      { pubkey: payer.toBase58(), isSigner: true, isWritable: true },
+      { pubkey: ownerQuote.toBase58(), isSigner: false, isWritable: true },
+      { pubkey: owner.toBase58(), isSigner: false, isWritable: false },
+      { pubkey: SOL.mint.toBase58(), isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId.toBase58(), isSigner: false, isWritable: false },
+      { pubkey: TOKEN_PROGRAM_ID.toBase58(), isSigner: false, isWritable: false },
+    ])
+    expect(exit?.programId.equals(ROUTER_PROGRAM_ID)).toBe(true)
+    expect(exit?.keys[0]?.pubkey.equals(payer)).toBe(true) // cranker signs, the owner does not
+    expect(exit?.keys.some((k) => k.isSigner && k.pubkey.equals(owner))).toBe(false)
+    expect(exit?.keys[4]?.pubkey.equals(ownerQuote)).toBe(true) // owner_quote is that same canonical ATA
+  })
+
+  it('derives the quote ATA under Token-2022 for an xStock quote', () => {
+    const market = makeMarket(TSLAX)
+    const position = makePosition(market)
+    const s = scenario([{ market, position }])
+
+    const txs = plan(s, payer)
+
+    expect(txs[0]?.map(normalize)).toEqual(expectedExit(market, TSLAX, position.owner, payer).map(normalize))
+    expect(txs[0]?.[0]?.keys[5]?.pubkey.equals(TOKEN_2022_PROGRAM_ID)).toBe(true)
+  })
+
+  it('skips a position whose market or pool progress was not fetched', () => {
+    const market = makeMarket()
+    const position = makePosition(market)
+    const noMarket: Scenario = { ...scenario([{ market, position }]), markets: new Map() }
+    const noProgress: Scenario = { ...scenario([{ market, position }]), poolProgress: new Map() }
+
+    expect(plan(noMarket, payer)).toEqual([])
+    expect(plan(noProgress, payer)).toEqual([])
+  })
+
+  it('skips a finalized market and a market whose quote mint the router does not allow', () => {
+    const finalized = makeMarket(SOL, { finalized: true })
+    const unknownQuote = makeMarket(SOL, { quoteMint: randomKey() })
+    const s = scenario([
+      { market: finalized, position: makePosition(finalized) },
+      { market: unknownQuote, position: makePosition(unknownQuote) },
+    ])
+
+    expect(plan(s, payer)).toEqual([])
+  })
+
+  it('gives one transaction per due position, the most overdue first', () => {
+    const [a, b, c] = [makeMarket(), makeMarket(TSLAX), makeMarket()] as const
+    const late = makePosition(a, { autoExitDeadline: NOW - 10n })
+    const latest = makePosition(b, { autoExitDeadline: NOW - 1_000n })
+    const notYet = makePosition(c, { autoExitDeadline: NOW + 10n })
+    const s = scenario([
+      { market: a, position: late },
+      { market: b, position: latest },
+      { market: c, position: notYet },
+    ])
+
+    const txs = plan(s, payer)
+
+    expect(txs).toHaveLength(2)
+    expect(txs.map((tx) => tx[1]?.keys[3]?.pubkey.toBase58())).toEqual([latest.address.toBase58(), late.address.toBase58()])
+  })
+
+  it('does not mutate its inputs', () => {
+    const market = makeMarket()
+    const s = scenario([{ market, position: makePosition(market, { autoExitDeadline: NOW - 1n }) }, { market, position: makePosition(market, { autoExitDeadline: NOW - 9n }) }])
+    const positions = Object.freeze([...s.positions]) as PositionAccount[]
+
+    expect(() => planAutoExits(positions, s.markets, s.poolProgress, NOW, payer)).not.toThrow()
+    expect(positions).toEqual(s.positions)
+  })
+})
+
+/* ---------- autoExitJob.run against an in-memory chain ---------- */
+
+const POSITION_DISCRIMINATOR = [170, 188, 143, 228, 122, 64, 247, 208]
+const MARKET_DISCRIMINATOR = [219, 190, 213, 55, 0, 227, 198, 154]
+const POSITION_SIZE = 97
+const MARKET_SIZE = 274
+const POOL_SIZE = 416
+const POOL_PROGRESS_OFFSET = 308
+const CLOCK_SIZE = 40
+const CLOCK_UNIX_TIMESTAMP_OFFSET = 32
+const AUTO_EXIT_NOT_DUE = 6020
+const AUTO_EXIT_CURVE_COMPLETE = 6021
+const BUFFER_INSUFFICIENT = 6015
+const CONFIRM_TIMEOUT_MS = 45_000
+const RPC_KEY = 'FAKEKEY0123456789abcdef'
+const RPC_ERROR = `failed to get info: request to https://rpc.example.invalid/v2/${RPC_KEY}?api-key=${RPC_KEY} failed, reason: ECONNRESET`
+/** Far past the wall clock, so only a job that reads the chain clock sees these deadlines as due. */
+const CHAIN_NOW = 4_000_000_000n
+
+function encodePosition(p: PositionAccount): Buffer {
+  const data = Buffer.alloc(POSITION_SIZE)
+  Buffer.from(POSITION_DISCRIMINATOR).copy(data, 0)
+  p.owner.toBuffer().copy(data, 8)
+  p.market.toBuffer().copy(data, 40)
+  data.writeBigUInt64LE(p.tokens, 72)
+  data.writeBigUInt64LE(p.basis, 80)
+  data.writeUInt8(p.bump, 88)
+  data.writeBigInt64LE(p.autoExitDeadline ?? 0n, 89)
+  return data
+}
+
+function encodeMarket(m: MarketAccount): Buffer {
+  const data = Buffer.alloc(MARKET_SIZE)
+  Buffer.from(MARKET_DISCRIMINATOR).copy(data, 0)
+  const keys = [m.pool, m.config, m.baseMint, m.quoteMint, m.baseVault, m.quoteVault, m.bufferVault]
+  keys.forEach((key, i) => key.toBuffer().copy(data, 8 + 32 * i))
+  data.writeBigUInt64LE(m.feeNumerator, 232)
+  data.writeUInt8(m.bump, 240)
+  data.writeBigUInt64LE(m.totalBasis, 241)
+  data.writeUInt8(m.finalized ? 1 : 0, 249)
+  return data
+}
+
+function encodePool(progress: number): Buffer {
+  const data = Buffer.alloc(POOL_SIZE)
+  data.writeUInt8(progress, POOL_PROGRESS_OFFSET)
+  return data
+}
+
+function encodeClock(unixTimestamp: bigint): Buffer {
+  const data = Buffer.alloc(CLOCK_SIZE)
+  data.writeBigInt64LE(unixTimestamp, CLOCK_UNIX_TIMESTAMP_OFFSET)
+  return data
+}
+
+interface SimulationValue {
+  readonly err: TransactionError | null
+  readonly logs: string[]
+}
+
+interface RawAccount {
+  readonly data: Buffer
+  readonly owner: PublicKey
+}
+
+interface Chain {
+  readonly positions: readonly { address: PublicKey; data: Buffer }[]
+  readonly accounts: ReadonlyMap<string, RawAccount>
+  readonly clockUnix: bigint
+  readonly simulate?: (tx: VersionedTransaction, index: number) => SimulationValue
+  readonly confirmErr?: TransactionError | null
+}
+
+const accountInfo = (data: Buffer, owner: PublicKey = ROUTER_PROGRAM_ID) => ({ data, owner, lamports: 1_000_000, executable: false, rentEpoch: 0 })
+
+function fakeConnection(chain: Chain) {
+  const simulated: VersionedTransaction[] = []
+  const sent: VersionedTransaction[] = []
+  const fake = {
+    getProgramAccounts: vi.fn(async (_programId: PublicKey) =>
+      chain.positions.map(({ address, data }) => ({ pubkey: address, account: accountInfo(data) })),
+    ),
+    getAccountInfo: vi.fn(async (key: PublicKey) => (key.equals(SYSVAR_CLOCK_PUBKEY) ? accountInfo(encodeClock(chain.clockUnix)) : null)),
+    getMultipleAccountsInfo: vi.fn(async (keys: PublicKey[]) =>
+      keys.map((key) => {
+        const account = chain.accounts.get(key.toBase58())
+        return account === undefined ? null : accountInfo(account.data, account.owner)
+      }),
+    ),
+    getLatestBlockhash: vi.fn(async () => ({ blockhash: randomKey().toBase58(), lastValidBlockHeight: 1_000 })),
+    simulateTransaction: vi.fn(async (tx: VersionedTransaction) => {
+      simulated.push(tx)
+      const value = chain.simulate?.(tx, simulated.length - 1) ?? { err: null, logs: [] }
+      return { context: { slot: 1 }, value }
+    }),
+    sendTransaction: vi.fn(async (tx: VersionedTransaction) => {
+      sent.push(tx)
+      return `sig-${sent.length}`
+    }),
+    confirmTransaction: vi.fn(async () => ({ context: { slot: 2 }, value: { err: chain.confirmErr ?? null } })),
+  }
+  return { connection: fake as unknown as Connection, fake, simulated, sent }
+}
+
+function routerFailure(code: number): SimulationValue {
+  const router = ROUTER_PROGRAM_ID.toBase58()
+  return {
+    err: { InstructionError: [1, { Custom: code }] },
+    logs: [`Program ${router} invoke [1]`, `Program ${router} failed: custom program error: 0x${code.toString(16)}`],
+  }
+}
+
+const fakeLog = () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() })
+
+function context(connection: Connection, payer: Keypair, maxTx = 10, log = fakeLog()): CrankContext {
+  return { connection, payer, cluster, log, maxTx }
+}
+
+interface ChainEntry {
+  readonly market: MarketAccount
+  readonly position: PositionAccount
+  readonly progress?: number
+}
+
+function chainOf(entries: readonly ChainEntry[], overrides: Partial<Chain> = {}): Chain {
+  const accounts = new Map<string, RawAccount>()
+  entries.forEach(({ market, progress }) => {
+    accounts.set(market.address.toBase58(), { data: encodeMarket(market), owner: ROUTER_PROGRAM_ID })
+    accounts.set(market.pool.toBase58(), { data: encodePool(progress ?? LIVE), owner: DBC_PROGRAM_ID })
+  })
+  return {
+    positions: entries.map(({ position }) => ({ address: position.address, data: encodePosition(position) })),
+    accounts,
+    clockUnix: CHAIN_NOW,
+    ...overrides,
+  }
+}
+
+const dueEntry = (deadline: bigint = CHAIN_NOW - 5n, quote: QuoteMintInfo = SOL): ChainEntry => {
+  const market = makeMarket(quote)
+  return { market, position: makePosition(market, { autoExitDeadline: deadline }) }
+}
+
+describe('autoExitJob', () => {
+  it("is named 'auto-exit'", () => {
+    expect(autoExitJob.name).toBe('auto-exit')
+  })
+
+  it('the test encoders round-trip through the SDK decoders', () => {
+    const { market, position } = dueEntry()
+
+    expect(decodePosition(position.address, encodePosition(position))).toEqual(position)
+    expect(decodeMarket(market.address, encodeMarket(market))).toEqual(market)
+  })
+
+  it('fetches Position accounts by discriminator, then simulates and sends one signed auto-exit transaction', async () => {
+    const payer = Keypair.generate()
+    const entry = dueEntry()
+    const chain = fakeConnection(chainOf([entry]))
+
+    const result = await autoExitJob.run(context(chain.connection, payer))
+
+    expect(result).toEqual({ sent: ['sig-1'], skipped: 0, errors: [] })
+    const [programId, config] = chain.fake.getProgramAccounts.mock.calls[0] as unknown as [PublicKey, { filters: unknown[] }]
+    expect(programId.equals(cluster.routerProgramId)).toBe(true)
+    expect(config.filters).toEqual([
+      { memcmp: { offset: 0, bytes: Buffer.from(POSITION_DISCRIMINATOR).toString('base64'), encoding: 'base64' } },
+    ])
+    const tx = chain.sent[0]
+    expect(chain.simulated[0]).toBe(tx)
+    expect(tx?.message.staticAccountKeys[0]?.equals(payer.publicKey)).toBe(true) // the crank pays
+    expect(tx?.signatures[0]?.some((byte) => byte !== 0)).toBe(true) // and signs
+    const programs = tx?.message.compiledInstructions.map((ix) => tx.message.staticAccountKeys[ix.programIdIndex]?.toBase58())
+    expect(programs).toEqual([ASSOCIATED_TOKEN_PROGRAM_ID.toBase58(), ROUTER_PROGRAM_ID.toBase58()])
+    expect(chain.fake.confirmTransaction).toHaveBeenCalledTimes(1)
+  })
+
+  it('reads now from the chain Clock sysvar, not the wall clock', async () => {
+    const notYetOnChain = fakeConnection(chainOf([dueEntry(CHAIN_NOW + 1n)]))
+    const dueOnChain = fakeConnection(chainOf([dueEntry(CHAIN_NOW)]))
+
+    const before = await autoExitJob.run(context(notYetOnChain.connection, Keypair.generate()))
+    const after = await autoExitJob.run(context(dueOnChain.connection, Keypair.generate()))
+
+    expect(before).toEqual({ sent: [], skipped: 0, errors: [] })
+    expect(notYetOnChain.fake.simulateTransaction).not.toHaveBeenCalled()
+    expect(after.sent).toHaveLength(1)
+    expect(dueOnChain.fake.getAccountInfo).toHaveBeenCalledWith(SYSVAR_CLOCK_PUBKEY)
+  })
+
+  it('does not simulate a due position on a complete curve', async () => {
+    const entry = { ...dueEntry(), progress: 2 }
+    const chain = fakeConnection(chainOf([entry]))
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
+
+    expect(result).toEqual({ sent: [], skipped: 0, errors: [] })
+    expect(chain.fake.simulateTransaction).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['AutoExitNotDue', AUTO_EXIT_NOT_DUE],
+    ['AutoExitCurveComplete', AUTO_EXIT_CURVE_COMPLETE],
+  ])('counts a %s simulation failure as skipped (info), not an error', async (name, code) => {
+    const log = fakeLog()
+    const chain = fakeConnection(chainOf([dueEntry()], { simulate: () => routerFailure(code) }))
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate(), 10, log))
+
+    expect(result).toEqual({ sent: [], skipped: 1, errors: [] })
+    expect(chain.fake.sendTransaction).not.toHaveBeenCalled()
+    expect(log.info).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ reason: name }))
+    expect(log.warn).not.toHaveBeenCalled()
+  })
+
+  it('records any other simulation failure as an error, skips that position and goes on with the next', async () => {
+    const log = fakeLog()
+    const entries = [dueEntry(CHAIN_NOW - 50n), dueEntry(CHAIN_NOW - 10n)]
+    const simulate = (_tx: VersionedTransaction, index: number) =>
+      index === 0 ? routerFailure(BUFFER_INSUFFICIENT) : { err: null, logs: [] }
+    const chain = fakeConnection(chainOf(entries, { simulate }))
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate(), 10, log))
+
+    expect(result.sent).toEqual(['sig-1'])
+    expect(result.errors).toHaveLength(1)
+    expect(result.errors[0]).toContain('BufferInsufficient')
+    expect(result.errors[0]).toContain(entries[0]?.position.address.toBase58())
+    expect(log.warn).toHaveBeenCalledTimes(1)
+  })
+
+  it('sends at most ctx.maxTx transactions and counts the rest as skipped', async () => {
+    const chain = fakeConnection(chainOf([dueEntry(), dueEntry(), dueEntry(CHAIN_NOW - 1n, TSLAX)]))
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate(), 1))
+
+    expect(result).toEqual({ sent: ['sig-1'], skipped: 2, errors: [] })
+    expect(chain.sent).toHaveLength(1)
+  })
+
+  it('does nothing when the tick has no transaction budget left', async () => {
+    const chain = fakeConnection(chainOf([dueEntry()]))
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate(), 0))
+
+    expect(result).toEqual({ sent: [], skipped: 0, errors: [] })
+    expect(chain.fake.getProgramAccounts).not.toHaveBeenCalled()
+  })
+
+  it('records a transaction that fails on chain as an error, not as sent', async () => {
+    const chain = fakeConnection(chainOf([dueEntry()], { confirmErr: { InstructionError: [1, { Custom: BUFFER_INSUFFICIENT }] } }))
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
+
+    expect(result.sent).toEqual([])
+    expect(result.errors).toHaveLength(1)
+    expect(result.errors[0]).toContain('sig-1')
+  })
+
+  it('records an undecodable Position account as an error and still exits the others', async () => {
+    const entry = dueEntry()
+    const base = chainOf([entry])
+    const garbage = { address: randomKey(), data: Buffer.from([...POSITION_DISCRIMINATOR, 1, 2, 3]) }
+    const chain = fakeConnection({ ...base, positions: [garbage, ...base.positions] })
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
+
+    expect(result.sent).toEqual(['sig-1'])
+    expect(result.errors).toHaveLength(1)
+    expect(result.errors[0]).toContain(garbage.address.toBase58())
+  })
+
+  it('does not read the progress byte of a pool account the DBC program does not own', async () => {
+    const entry = dueEntry()
+    const base = chainOf([entry])
+    const pool = entry.market.pool.toBase58()
+    const accounts = new Map([...base.accounts, [pool, { data: encodePool(LIVE), owner: randomKey() }]])
+    const chain = fakeConnection({ ...base, accounts })
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
+
+    expect(result).toEqual({ sent: [], skipped: 0, errors: [expect.stringContaining(pool)] })
+    expect(chain.fake.simulateTransaction).not.toHaveBeenCalled()
+  })
+
+  it('gives up on a confirmation after 45 s, logs the outcome as unknown and does not resend it', async () => {
+    vi.useFakeTimers()
+    try {
+      const log = fakeLog()
+      const chain = fakeConnection(chainOf([dueEntry()]))
+      chain.fake.confirmTransaction.mockImplementationOnce(() => new Promise(() => undefined))
+      let settled = false
+
+      const pending = autoExitJob.run(context(chain.connection, Keypair.generate(), 10, log)).finally(() => {
+        settled = true
+      })
+      await vi.advanceTimersByTimeAsync(CONFIRM_TIMEOUT_MS - 1)
+      expect(settled).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      const result = await pending
+
+      expect(result.sent).toEqual([])
+      expect(result.errors).toEqual([expect.stringMatching(/sig-1 outcome unknown/)])
+      expect(chain.fake.sendTransaction).toHaveBeenCalledTimes(1)
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('unknown'), expect.objectContaining({ signature: 'sig-1' }))
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reduces RPC URLs in error strings to their host, so a provider key never reaches result.errors', async () => {
+    const fetchFails = fakeConnection(chainOf([dueEntry()]))
+    fetchFails.fake.getProgramAccounts.mockRejectedValueOnce(new Error(RPC_ERROR))
+    const sendFails = fakeConnection(chainOf([dueEntry()]))
+    sendFails.fake.getLatestBlockhash.mockRejectedValueOnce(new Error(RPC_ERROR))
+
+    const results = [
+      await autoExitJob.run(context(fetchFails.connection, Keypair.generate())),
+      await autoExitJob.run(context(sendFails.connection, Keypair.generate())),
+    ]
+
+    results.forEach((result) => {
+      expect(result.errors).toHaveLength(1)
+      expect(result.errors[0]).toContain('rpc.example.invalid')
+      expect(result.errors[0]).not.toContain(RPC_KEY)
+    })
+  })
+
+  it('never throws: an RPC failure becomes an error in the result', async () => {
+    const chain = fakeConnection(chainOf([dueEntry()]))
+    chain.fake.getProgramAccounts.mockRejectedValueOnce(new Error('429 Too Many Requests'))
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
+
+    expect(result.sent).toEqual([])
+    expect(result.errors).toEqual([expect.stringContaining('429 Too Many Requests')])
+  })
+
+  it('never throws when the cluster config cannot be resolved', async () => {
+    const chain = fakeConnection(chainOf([dueEntry()]))
+    const ctx = Object.defineProperty({ ...context(chain.connection, Keypair.generate()) }, 'cluster', {
+      get: () => {
+        throw new Error('no cluster config')
+      },
+    })
+
+    await expect(autoExitJob.run(ctx)).resolves.toEqual({ sent: [], skipped: 0, errors: [expect.stringContaining('no cluster config')] })
+  })
+})
