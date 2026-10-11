@@ -1,0 +1,288 @@
+{
+ "task": "QA-02",
+ "cluster": "devnet",
+ "routerProgramId": "D4sk6wwELD6cmd7tv6hE4hkxQP8SF8tjdegYym8iWNNb",
+ "hookProgramId": "CUNNV1MqVB53N4jWn91uVFXm1dBSyaynR6iBCbufJWMS",
+ "dbcProgramId": "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN",
+ "payer": "CamCkeR9iqBij1ZyrEYj9mp6emQtpMVdWWVCUX46tFLE",
+ "traders": [
+  "HdgqsLVTf96y6c1bidvvfczoELhegjvvwpS5Q3Ec68Lf",
+  "4haa3Nj9gq9emeiQN4HpX2TioVcSBijzyV9gNx8dqTAw",
+  "Dmb189CGQ3LBNZEjyJqYxSJ7efX1mqUVsQ2W5fMUVw4F",
+  "8VU1nsef2WaqEjzfAdc4pKG1Jjrb33JBCqBCFWzkp7A1",
+  "5kgHzj5UuQP7sfQDUaAkoQ7p6EnM7fXNrGNRJQMniVuU",
+  "GFGjUuNmtYGFmRiefRNSnYBXEWpKZXFPSXLAPvRxsuFy",
+  "2xRLi7HTx4cdxr2L5DucnuGuXLaNfrVFkB464zsQXN9V"
+ ],
+ "migrationQuoteThreshold": "300000000",
+ "feeBps": 100,
+ "buyChunkLamports": "7500000",
+ "crankGuards": {
+  "CLUSTER": "devnet",
+  "MAX_TX_PER_TICK": "10",
+  "MIN_ATA_VALUE_LAMPORTS": "0",
+  "MAX_ATA_CREATES_PER_TICK": "10",
+  "CRANK_MIN_SOL_LAMPORTS": "50000000",
+  "MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS": "0"
+ },
+ "startedAt": "2026-10-11T13:27:27.291Z",
+ "payerSolBefore": "13.008821394",
+ "accounts": {
+  "market": "DdDWi1hFKSk5D2ErQk9VPUbzRDHwbr2ms7ctUdJPT7tV",
+  "pool": "ByyVrWKM3UqPCZAT97LCCh3ur7bHYqYr8Ns2wm4cbyz2",
+  "config": "BUgJee4NN159KoDmyMmMSnjS2EXoXSaGz3GT34T3dDUE",
+  "baseMint": "7HgZTCeYe8pvsWyCB5JHsnBccGfbEw2vYpfsQwy9wVXK",
+  "quoteMint": "So11111111111111111111111111111111111111112",
+  "baseVault": "9TTokr3RNxqwWfST8ia14CctmPaCEi28sQ6x9Au62xCy",
+  "quoteVault": "94xDgLwtLY1TWJfRdDAv8LX5NohAKEJ99Gucp7dkd3aa",
+  "bufferVault": "6pUCPPCHDWpyVrxfCfoWmxJkDA5WMGXbExtFFyYyNkd4",
+  "autoExitPosition": "4A9c72FHubGC8KeSmz1irJTqzTyTdC1KL1scav7aGVbz",
+  "dammConfig": "7F6dnUcRuyM2TwR8myT1dYypFXpPSxqwKNSFNkxyNESd",
+  "dammPool": "2guf3Tfy5tEv5EDykpY6yyS2cW9TATVSZsfn13Y7Yuni"
+ },
+ "steps": [
+  {
+   "n": 1,
+   "name": "launch: wSOL market via buildLaunchPlan, threshold 0.3 SOL",
+   "pass": true,
+   "detail": "market DdDWi1hFKSk5D2ErQk9VPUbzRDHwbr2ms7ctUdJPT7tV, threshold 300000000, hook CUNNV1MqVB53N4jWn91uVFXm1dBSyaynR6iBCbufJWMS, cap 159999961978257",
+   "signatures": {
+    "launch": [
+     "4PAtvBeo2BQSKXoZCbY2Z4zZVbpAyF5LuSMV3oAThdoUpu3jxqmeFRAH9Z7gebVbnLtYc3eAZn8hxF8WtwfnPGgU",
+     "2BeSS8XhbryRTpviBjANMMsd8WVec6tXketgHcLXvhYpBXbBSSoHy2pdZRYQtTfgKsp9VoG4pQAZ7ps3QBFmdepK",
+     "2BK2k34UxVxiZEQsyCrQkjmgwk1k9UntKq4cD2QnDga7BvZt3MVFjfWEmL1ooo93XqsaTYtsiCYdeocDwNbsqiPd"
+    ]
+   },
+   "accounts": {
+    "market": "DdDWi1hFKSk5D2ErQk9VPUbzRDHwbr2ms7ctUdJPT7tV",
+    "pool": "ByyVrWKM3UqPCZAT97LCCh3ur7bHYqYr8Ns2wm4cbyz2",
+    "config": "BUgJee4NN159KoDmyMmMSnjS2EXoXSaGz3GT34T3dDUE",
+    "baseMint": "7HgZTCeYe8pvsWyCB5JHsnBccGfbEw2vYpfsQwy9wVXK",
+    "quoteMint": "So11111111111111111111111111111111111111112",
+    "baseVault": "9TTokr3RNxqwWfST8ia14CctmPaCEi28sQ6x9Au62xCy",
+    "quoteVault": "94xDgLwtLY1TWJfRdDAv8LX5NohAKEJ99Gucp7dkd3aa",
+    "bufferVault": "6pUCPPCHDWpyVrxfCfoWmxJkDA5WMGXbExtFFyYyNkd4"
+   }
+  },
+  {
+   "n": 2,
+   "name": "7 traders buy (wrap): every quoteBuy prediction matches its BuyEvent",
+   "pass": true,
+   "detail": "7/7 BuyEvents match quoteBuy (tokensOut, netIntoCurve, basis), 7500000 lamports each",
+   "signatures": {
+    "buys": [
+     "2MFco1f8C4s24H2P72dsHtJG78nKhxGAUZGiepb5jRyrTMxsuf51JeUQEubuFTojNAua9dhedU3P4KvCLa7zXrFy",
+     "28TSuLfjks6KjWDzocRps2SPgMwiiFnmHB3WjoZ7jUGremvDcnURhFC31nNjxUTdM1REMDBQdPtUxYmDtriXiiMU",
+     "3jQRWM1hqqDBsXPRpggScCvpQujKNuaW7WF9cQX9GzDoessdt7DEfN9QbCo8b2x3f8FVs3X9y7nK9o4irQdvQ3K5",
+     "4ymJNxo2UjaV3Nw2yrgvnWot9VcPQFpEcCzdEijEL1DaVmHjTxz4aPEHfPKh3Bq7jubvcHfUGfhDYp4BMigg7y6C",
+     "3gZBXGKVTdj4zy5SZS4KAxzaecCcudmrg8PnPQFuxMbrBEgmXr8xvMvmj7tSLnr1Py5nvjKskF8SFSzz2Kpdbt4w",
+     "34MSB7segrHAuQWLCKB2ucKuxrGS15k3Vzq2qUhsdvDFciEy6jZLp54QckGNUwXQrGc2GW33TmPohBW8D8NuWjBy",
+     "4JKntWXq1KAtHjzsR9fT5cjA9sMFp4ybQ5Xnp4TxAXx9PzguLt9hPdMR3j5TfAdK1PZsb51cuidDKcKLMiJnV3Mn"
+    ]
+   }
+  },
+  {
+   "n": 3,
+   "name": "Your floor: floorValue equals the on-chain refund of a later full exit",
+   "pass": true,
+   "detail": "floor 7350732, refund 7350732, wSOL received 7350732 after 2 price-moving buys",
+   "signatures": {
+    "priceMoves": [
+     "5gyffpSGhx9tCcjGYoBPrWFaGiN3vCwVv4nnX56joU1cTaeohisarNmbTw5NGKjmiNTc2SVeccw3sMpqjwajKS5B",
+     "3fFdQxwcfpvPiqLUF2kgdcHy7fKWyS2GuHzSbjLBAcfAozLEU9ponrFsUDhYgoWXUnajUFZMTvbZb6fwxQurN7zj"
+    ],
+    "exit": "4iEufNxa18h6fyvMcRVvtaqAPybcxvFNpB1X7zFT8NsknjaGuX3by2sVFeay7oodDjkerEE7hZAo4QKPq3CrPwsw"
+   }
+  },
+  {
+   "n": 4,
+   "name": "exit at cost: refund == quoteExit.refund",
+   "pass": true,
+   "detail": "32096571546813 of 64193143093626 tokens: refund 3675365, quoteExit.refund 3675365, wSOL received 3675365",
+   "signatures": {
+    "exit": "5p1w9SvJfAhV7ZoTJ7KqVkTozBw6bt3iuaKeJPYQJKTpY8rAScDHxPXMc11UgFmf2TgSUKHhjrULn4jK4ngqCVnM"
+   }
+  },
+  {
+   "n": 5,
+   "name": "hook rejects a direct DBC buy and a wallet-to-wallet transfer (6000)",
+   "pass": true,
+   "detail": "direct DBC buy: hook 6000 TransferNotViaRouter; transfer: hook 6000 TransferNotViaRouter"
+  },
+  {
+   "n": 6,
+   "name": "a buy above 20% of the curve supply is rejected (6022)",
+   "pass": true,
+   "detail": "buy of 64216143 lamports: 44531613111152 + 229192634897481 > cap 159999961978257: router 6022 PositionCapExceeded"
+  },
+  {
+   "n": 7,
+   "name": "Auto-Exit 20 s ahead: autoExitJob exits after the deadline, refund == floor",
+   "pass": true,
+   "detail": "deadline 1791725309, before it the job sent 0; at chain time 1791725310 it sent 1: refund 7350732, floor 7350732, wSOL received 7350732",
+   "signatures": {
+    "setAutoExit": "4PX45zaTXNaYsT2SmeqsFq2vqUvFZegZhnwCHZLp2xjmXp6562Ju9sqDS4D18dLYb3FhpKYgBiBEDogJTwMfUDfb",
+    "autoExit": "5VGEs3wYHhF5MC6WMYHHotMH6nGLJiCf9vzvyEEq1VphkK12PKSsMphebjgfgY3vG5DkELALePsuxvWrm5WrmSo3"
+   },
+   "accounts": {
+    "autoExitPosition": "4A9c72FHubGC8KeSmz1irJTqzTyTdC1KL1scav7aGVbz"
+   }
+  },
+  {
+   "n": 8,
+   "name": "graduation: no position above the cap, transfer hook revoked",
+   "pass": true,
+   "detail": "36 buys of 7500000, migrationProgress 2, largest position 137021674037884 <= cap 159999961978257, hook program 11111111111111111111111111111111",
+   "signatures": {
+    "graduationBuys": [
+     "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"
+    ]
+   }
+  },
+  {
+   "n": 9,
+   "name": "finalizeJob: market finalized",
+   "pass": true,
+   "detail": "finalized true, surplus snapshot 15045373 (buffer 15045373), basis snapshot 315196623 (positions 315196623)",
+   "signatures": {
+    "finalize": [
+     "5whQtuZq2QW9EGNNuFSQUPWgqr7HvCS3x8Fyx238c9mfTQCWkntndQ4wtTtVv7Y2P1LG5LDw8gsmZfZ8B5SzDxUa"
+    ]
+   }
+  },
+  {
+   "n": 10,
+   "name": "migrateJob: DAMM v2 pool exists",
+   "pass": true,
+   "detail": "DAMM v2 pool 2guf3Tfy5tEv5EDykpY6yyS2cW9TATVSZsfn13Y7Yuni owned by cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG, DBC pool migrated true",
+   "signatures": {
+    "migrate": [
+     "3MN3pWBJdbyM2esp1r15rDZivke2ELp8dugTTKTGJGoH5Dmtyky3X5hJGc8Gyqnicpz3KnVcVjAVvqKzF54eptKz"
+    ]
+   },
+   "accounts": {
+    "dammConfig": "7F6dnUcRuyM2TwR8myT1dYypFXpPSxqwKNSFNkxyNESd",
+    "dammPool": "2guf3Tfy5tEv5EDykpY6yyS2cW9TATVSZsfn13Y7Yuni"
+   }
+  },
+  {
+   "n": 11,
+   "name": "claimsJob: every position closed, sum of shares <= surplus snapshot",
+   "pass": true,
+   "detail": "7 claims for 7 positions, 0 left; shares 15045370 of snapshot 15045373, residual 3 <= 7",
+   "signatures": {
+    "claims": [
+     "4jQmiR5ZTLWrWAAcvXpyb2sMebYFLRnyBaSVGSKbKqr8A4ArA2FnwZMhn6WeY7qzGbXqQsGb84CxdTtNygoZxgGL",
+     "2nsoNrNCQ2vB7ebe52LvMJ44wQUybduvs7pfzffHGmQen8vJo8GP4pxHihyaCTtabZvhEJRUvHqwYwHdirZzxXkp",
+     "4yZJfPMef9i8y4rpcQWhsCnYhDFG9bonCJ54AwGXzuNq63JoGugUt8HoZM7rWkcVUBvaq6EJ4VNTy7oxcsoHYXKj",
+     "2kRhuRokupfUonxzi81ya87VyZiBup4XHrhpRAwPdzgfaTYSaKYLUeXE1Eodfgvqqxf2kCMYmtxkYZJvF7XyLZu5",
+     "4GN4PWbUJJX2XWmxMCG2iKG3njz6B7PEG1NB43g7qLyHVvgtVcRz43pjWSShfp7T3RDHEXy1efXedFNojYRXSrom",
+     "SQC5Nt9L1dDS4C1wv1S2WDezwYp9mrrcED9m9CWRcSHwXwFKmGC3BKC8jUcoTfRQNWoNRWVry6sr7XKNbwT2aXB",
+     "56RCtC7YSXYXZBc8ow8zHXfS1ni5PxPaKTogixkaBQ9ebrRpD531dMucW1MMQMNtEH1RMbJoNfsq6G2tFvM5vCYo"
+    ]
+   }
+  },
+  {
+   "n": 12,
+   "name": "after graduation: plain wallet transfer succeeds",
+   "pass": true,
+   "detail": "1 raw token, plain transferChecked without hook accounts: 132448711156264 -> 132448711156263, 132822613487077 -> 132822613487078",
+   "signatures": {
+    "transfer": "LxoYCG5jhnn2wUNiRHMfL1Rwif7FhvuH86rAEfd1QnsXEE9vknHwYL2r3BQDxZkDKLUx99euDdgo2KeMR2kuZPQ"
+   }
+  },
+  {
+   "n": 13,
+   "name": "sweep: trader SOL returned to the payer",
+   "pass": true,
+   "detail": "swept 0.069040484 SOL from 7 traders, 0 failed, 0 lamports left in wallets and wSOL ATAs",
+   "signatures": {
+    "sweep": [
+     "5y6FxWDpNsnuRR6kPxzEMksXufEavLMuMCoNBL5CNyxhcLB2R7nzfyvdH4ucfR6wMfRQwhcsRhiwxBJrn736yALa",
+     "52fDtJoUofdvh8YdA3stTgnaY9aY4zd3JZcSS8eHC3SgfDuhAmmyNxMcj4SLAemuXYwNeP1wxk9ms79rryAdksq3",
+     "4yyjwCqwifiSk91bVrj8Mek3SoFQaAPnmMoo3xydbXVes1o2Bpfaz2cAapqCAaQ6w2fzaKsagZZoKph1ohYAghns",
+     "ZUKsspyUEoGGHzntkepHGJtPd4AhP1xupPuRR4N5jFDF8kMGJ9bwHLdC3EYZMDF8AFxkj95W7ihE7MTkyEGUw3v",
+     "3naGJ2ysKCb1ajyCRKmt9Ld5h7aW9XCP2JmwR3crMwt47xNZzaPgAaBzgSiS6PqRphykPVxPq5UsBUUWSqAaBZNB",
+     "5MZNoVvG6Qu6GHKYcnbwJpvrtfAnb2rVJXRtoHLxn5p3ukLQqL2eWnvP7uQ5hUEwvPSiXWRzJsgAkhjan3MuRVof",
+     "5SRZGLWGdMKgANyo8Uc1wGRaR5n7fCxgtQufAgFiGfw1ZG4szytzPThFSA8SJRGGtcj7R2XHaMMmJWnHymu5JPsy"
+    ]
+   }
+  }
+ ],
+ "finishedAt": "2026-10-11T13:31:12.359Z",
+ "payerSolAfter": "12.657660358",
+ "spentSol": "0.351161036",
+ "sweep": [
+  {
+   "trader": "HdgqsLVTf96y6c1bidvvfczoELhegjvvwpS5Q3Ec68Lf",
+   "lamports": "14463104",
+   "signature": "5y6FxWDpNsnuRR6kPxzEMksXufEavLMuMCoNBL5CNyxhcLB2R7nzfyvdH4ucfR6wMfRQwhcsRhiwxBJrn736yALa"
+  },
+  {
+   "trader": "4haa3Nj9gq9emeiQN4HpX2TioVcSBijzyV9gNx8dqTAw",
+   "lamports": "11316400",
+   "signature": "52fDtJoUofdvh8YdA3stTgnaY9aY4zd3JZcSS8eHC3SgfDuhAmmyNxMcj4SLAemuXYwNeP1wxk9ms79rryAdksq3"
+  },
+  {
+   "trader": "Dmb189CGQ3LBNZEjyJqYxSJ7efX1mqUVsQ2W5fMUVw4F",
+   "lamports": "14811492",
+   "signature": "4yyjwCqwifiSk91bVrj8Mek3SoFQaAPnmMoo3xydbXVes1o2Bpfaz2cAapqCAaQ6w2fzaKsagZZoKph1ohYAghns"
+  },
+  {
+   "trader": "8VU1nsef2WaqEjzfAdc4pKG1Jjrb33JBCqBCFWzkp7A1",
+   "lamports": "7112372",
+   "signature": "ZUKsspyUEoGGHzntkepHGJtPd4AhP1xupPuRR4N5jFDF8kMGJ9bwHLdC3EYZMDF8AFxkj95W7ihE7MTkyEGUw3v"
+  },
+  {
+   "trader": "5kgHzj5UuQP7sfQDUaAkoQ7p6EnM7fXNrGNRJQMniVuU",
+   "lamports": "7112372",
+   "signature": "3naGJ2ysKCb1ajyCRKmt9Ld5h7aW9XCP2JmwR3crMwt47xNZzaPgAaBzgSiS6PqRphykPVxPq5UsBUUWSqAaBZNB"
+  },
+  {
+   "trader": "GFGjUuNmtYGFmRiefRNSnYBXEWpKZXFPSXLAPvRxsuFy",
+   "lamports": "7112372",
+   "signature": "5MZNoVvG6Qu6GHKYcnbwJpvrtfAnb2rVJXRtoHLxn5p3ukLQqL2eWnvP7uQ5hUEwvPSiXWRzJsgAkhjan3MuRVof"
+  },
+  {
+   "trader": "2xRLi7HTx4cdxr2L5DucnuGuXLaNfrVFkB464zsQXN9V",
+   "lamports": "7112372",
+   "signature": "5SRZGLWGdMKgANyo8Uc1wGRaR5n7fCxgtQufAgFiGfw1ZG4szytzPThFSA8SJRGGtcj7R2XHaMMmJWnHymu5JPsy"
+  }
+ ],
+ "summary": "13 passed, 0 failed"
+}
