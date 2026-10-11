@@ -1,11 +1,11 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Keypair } from '@solana/web3.js'
+import { Connection, Keypair } from '@solana/web3.js'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { loadConfig, loadCrankKeypair, type WorkerConfig } from '../src/config.js'
 import { startCrank, type CrankContext, type CrankJob } from '../src/crank/index.js'
-import { log } from '../src/log.js'
+import { log, registerSecret } from '../src/log.js'
 
 const SECRET = 'SECRETKEY'
 const SECRET_RPC_URL = `https://example.invalid/v2/${SECRET}`
@@ -26,13 +26,14 @@ function thrownText(fn: () => unknown): string {
   throw new Error('expected the call to throw')
 }
 
-function captureStdout(): { entries: () => LogEntry[]; restore: () => void } {
+function captureStdout(): { raw: () => string; entries: () => LogEntry[]; restore: () => void } {
   const chunks: string[] = []
   const spy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk: string | Uint8Array) => {
     chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'))
     return true
   })
   return {
+    raw: () => chunks.join(''),
     entries: () =>
       chunks
         .join('')
@@ -185,6 +186,87 @@ describe('log', () => {
     out.restore()
 
     expect(out.entries()[0]).toMatchObject({ level: 'info', msg: 'real' })
+  })
+
+  it('never dumps Keypair, Connection, URL, Buffer or Uint8Array internals', () => {
+    const kp = Keypair.generate()
+    const secretBytes = Array.from(kp.secretKey)
+    const out = captureStdout()
+
+    log.info('objects', {
+      kp,
+      conn: new Connection(SECRET_RPC_URL),
+      url: new URL(SECRET_RPC_URL),
+      buf: Buffer.from(kp.secretKey),
+      bytes: kp.secretKey,
+      nested: { list: [kp], map: new Map([['k', kp]]) },
+    })
+    out.restore()
+
+    const line = out.raw()
+    expect(out.entries()[0]).toMatchObject({
+      kp: '[Keypair]',
+      conn: '[Connection]',
+      url: '[URL]',
+      buf: '[Buffer]',
+      bytes: '[Uint8Array]',
+      nested: { list: ['[Keypair]'], map: '[Map]' },
+    })
+    expect(line).not.toContain(SECRET)
+    expect(line).not.toContain('example.invalid')
+    expect(line).not.toContain(secretBytes.slice(0, 8).join(','))
+    expect(line).not.toContain(`"0":${secretBytes[0]},"1":${secretBytes[1]}`)
+    expect(line).not.toContain(Buffer.from(kp.secretKey).toString('base64'))
+    expect(line).not.toContain(Buffer.from(kp.secretKey).toString('hex'))
+  })
+
+  it('logs a PublicKey as base58 and a Date as an ISO string', () => {
+    const kp = Keypair.generate()
+    const out = captureStdout()
+
+    log.info('values', { pub: kp.publicKey, at: new Date(0), bad: new Date(Number.NaN) })
+    out.restore()
+
+    expect(out.entries()[0]).toMatchObject({
+      pub: kp.publicKey.toBase58(),
+      at: '1970-01-01T00:00:00.000Z',
+      bad: '[Invalid Date]',
+    })
+  })
+
+  it('scrubs registered secrets from the whole line and ignores values shorter than 8 chars', () => {
+    const secret = 'sk-live-0123456789'
+    registerSecret(secret)
+    registerSecret('tiny')
+    const out = captureStdout()
+
+    log.error(`request with ${secret} failed`, {
+      detail: `path /v2/${secret}`,
+      nested: { key: secret },
+      err: new Error(`bad key ${secret}`),
+      small: 'tiny',
+    })
+    out.restore()
+
+    expect(out.raw()).not.toContain(secret)
+    expect(out.entries()[0]).toMatchObject({
+      msg: 'request with [redacted] failed',
+      detail: 'path /v2/[redacted]',
+      nested: { key: '[redacted]' },
+      err: 'bad key [redacted]',
+      small: 'tiny',
+    })
+  })
+
+  it('scrubs a registered secret that JSON escapes inside the line', () => {
+    const secret = 'quote"and\\slash-secret'
+    registerSecret(secret)
+    const out = captureStdout()
+
+    log.info('escaped', { value: secret })
+    out.restore()
+
+    expect(out.entries()[0]?.value).toBe('[redacted]')
   })
 })
 
