@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Connection, Keypair } from '@solana/web3.js'
@@ -6,17 +7,32 @@ import { getClusterConfig } from '@trucee/sdk'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { defaultCrankGuards, loadConfig, loadCrankKeypair, quoteMinimums, type WorkerConfig } from '../src/config.js'
 import { startCrank, type CrankContext, type CrankJob } from '../src/crank/index.js'
-import { log, registerSecret } from '../src/log.js'
+import { errorMessage, log, registerSecret } from '../src/log.js'
 
 const SECRET = 'SECRETKEY'
 const SECRET_RPC_URL = `https://example.invalid/v2/${SECRET}`
 const LOCAL_RPC_URL = 'http://127.0.0.1:8899'
 const TEST_INTERVAL_MS = 5
 const INVALID_INLINE_KEYPAIR = 'CRANK_KEYPAIR is not a valid 64-byte keypair array'
+const NOT_A_KEYPAIR = 'CRANK_KEYPAIR is neither a readable file path nor a 64-byte JSON array'
+/** A leak of any run of this many characters of a key counts as a leak of the key. */
+const LEAK_WINDOW = 16
 const DEFAULT_KEYPAIR_PATH = join(homedir(), '.config', 'solana', 'id.json')
 
 /** The keypair as solana-keygen writes it and as SSM injects it into CRANK_KEYPAIR on ECS. */
 const inlineKeypair = (kp: Keypair): string => JSON.stringify(Array.from(kp.secretKey))
+
+/** bs58 comes with @solana/web3.js and ships no types: the wallet export form of a secret key. */
+const bs58 = createRequire(import.meta.url)('bs58') as { readonly encode: (bytes: Uint8Array) => string }
+
+/** Every LEAK_WINDOW-character run of `value`, as given and JSON-escaped, that appears in `text`. */
+function leakedWindows(text: string, value: string): string[] {
+  const forms = [value, JSON.stringify(value).slice(1, -1)]
+  const windows = forms.flatMap((form) =>
+    Array.from({ length: Math.max(0, form.length - LEAK_WINDOW + 1) }, (_, i) => form.slice(i, i + LEAK_WINDOW)),
+  )
+  return windows.filter((window) => text.includes(window))
+}
 
 type LogEntry = Record<string, unknown>
 
@@ -289,7 +305,7 @@ describe('CRANK_KEYPAIR inline keypair (CRK-12)', () => {
     const out = captureStdout()
 
     log.info('config', { cfg, raw: `${spaced}\n` })
-    log.info('bytes', { bytes: Array.from(kp.secretKey), text: inlineKeypair(kp) })
+    log.info('bytes', { bytes: Array.from(kp.secretKey), text: inlineKeypair(kp), base58: bs58.encode(kp.secretKey) })
     for (const value of malformed) log.error('worker failed to start', { value })
     out.restore()
 
@@ -298,8 +314,72 @@ describe('CRANK_KEYPAIR inline keypair (CRK-12)', () => {
     expect(raw).not.toContain(JSON.stringify(spaced).slice(1, -1))
     expect(raw).not.toContain(inlineKeypair(kp))
     expect(raw).not.toContain(Array.from(kp.secretKey).slice(0, 8).join(','))
+    expect(raw).not.toContain(bs58.encode(kp.secretKey))
     for (const value of malformed) expect(raw).not.toContain(JSON.stringify(value).slice(1, -1))
     expect(raw).toContain('[redacted]')
+  })
+
+  /** A crank key pasted in a form CRANK_KEYPAIR does not take: none starts with [, so each is read as a file path. */
+  function misformattedKeys(): ReadonlyArray<readonly [string, string]> {
+    const secretKey = Keypair.generate().secretKey
+    const array = JSON.stringify(Array.from(secretKey))
+    return [
+      ['base58 (wallet export)', bs58.encode(secretKey)],
+      ['a quoted array', `"${array}"`],
+      ['an object with secretKey', JSON.stringify({ secretKey: Array.from(secretKey) })],
+      ['0x hex', `0x${Buffer.from(secretKey).toString('hex')}`],
+    ]
+  }
+
+  it('never echoes a misformatted key read as a path, in the error or in any log line', () => {
+    for (const [label, value] of misformattedKeys()) {
+      const cfg = loadConfig({ ...base, CRANK_KEYPAIR: value })
+      const out = captureStdout()
+
+      const text = thrownText(() => loadCrankKeypair(cfg.crankKeypairPath))
+      log.error('worker failed to start', { error: text })
+      log.error('crank keypair', { value, trimmed: value.trim(), cfg })
+      out.restore()
+
+      expect(() => loadCrankKeypair(cfg.crankKeypairPath), label).toThrow(new Error(NOT_A_KEYPAIR))
+      expect(leakedWindows(text, value), label).toEqual([])
+      expect(leakedWindows(out.raw(), value), label).toEqual([])
+    }
+  })
+
+  it('names the path in an error only when the value looks like a path of at most 256 characters', () => {
+    const missing = join(tempDir, 'missing-crank.json')
+    const tooLong = `/${'k'.repeat(256)}.json`
+
+    expect(() => loadCrankKeypair(missing)).toThrow(`Cannot read crank keypair file ${missing} (ENOENT)`)
+    expect(() => loadCrankKeypair('~/crk12-missing.json')).toThrow(
+      `Cannot read crank keypair file ${join(homedir(), 'crk12-missing.json')} (ENOENT)`,
+    )
+    expect(() => loadCrankKeypair('./crk12-missing.json')).toThrow('Cannot read crank keypair file ./crk12-missing.json (ENOENT)')
+    expect(() => loadCrankKeypair('.crk12-missing.json')).toThrow('Cannot read crank keypair file .crk12-missing.json (ENOENT)')
+    expect(() => loadCrankKeypair('keys\\crk12-missing.json')).toThrow('Cannot read crank keypair file keys\\crk12-missing.json (ENOENT)')
+    for (const value of ['crk12-missing.json', tooLong]) {
+      expect(() => loadCrankKeypair(value), value).toThrow(new Error(NOT_A_KEYPAIR))
+    }
+  })
+
+  it('registers a file path value with the log redaction before reading it, and the loaded key in every form', () => {
+    const missing = join(tempDir, 'crk12-registered.json')
+    expect(() => loadCrankKeypair(missing)).toThrow(/crank keypair file/)
+    loadCrankKeypair(keypairPath)
+    const out = captureStdout()
+
+    log.info('paths', { missing, base58: bs58.encode(testKeypair.secretKey), bytes: inlineKeypair(testKeypair) })
+    out.restore()
+
+    expect(out.raw()).not.toContain(missing)
+    expect(out.raw()).not.toContain(bs58.encode(testKeypair.secretKey))
+    expect(out.raw()).not.toContain(inlineKeypair(testKeypair))
+  })
+
+  it('reads a relative path starting with [ as an inline array, which fails closed', () => {
+    expect(() => loadCrankKeypair('[keys]/crank.json')).toThrow(new Error(INVALID_INLINE_KEYPAIR))
+    expect(() => loadConfig({ ...base, CRANK_KEYPAIR: '[keys]/crank.json' })).toThrow(INVALID_INLINE_KEYPAIR)
   })
 
   it('still reads a keypair file path: trimmed, with ~ expanded, even when it contains [', () => {

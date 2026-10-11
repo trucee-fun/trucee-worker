@@ -3,12 +3,16 @@
  * RPC_URL embeds a provider API key and the keypair is a signing secret: neither ever reaches an error or a log.
  */
 import { readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { Keypair } from '@solana/web3.js'
 import type { QuoteMintInfo, QuoteSymbol } from '@trucee/sdk'
 import { z } from 'zod'
 import { registerSecret } from './log.js'
+
+/** bs58 4 comes with @solana/web3.js (not a worker dependency of its own) and ships no types: only encode is used. */
+const bs58 = createRequire(import.meta.url)('bs58') as { readonly encode: (bytes: Uint8Array) => string }
 
 const CLUSTERS = ['devnet', 'mainnet-beta', 'localnet'] as const
 export type WorkerCluster = (typeof CLUSTERS)[number]
@@ -44,7 +48,7 @@ export interface WorkerConfig extends CrankGuards {
   rpcUrl: string
   /**
    * What loadCrankKeypair reads the crank keypair from: a solana-keygen file path (~ expanded), or the 64-byte JSON array
-   * itself when CRANK_KEYPAIR holds the keypair (ECS injects it from SSM). That array is a secret: loadConfig registers it
+   * itself when CRANK_KEYPAIR holds the keypair (ECS injects it from SSM). loadConfig registers the value, path or array,
    * with the log redaction.
    */
   crankKeypairPath: string
@@ -74,6 +78,13 @@ const MIN_CRANK_INTERVAL_MS = 100
 const SECRET_KEY_BYTES = 64
 /** The only error an inline CRANK_KEYPAIR ever produces: it must never echo the value. */
 const INLINE_KEYPAIR_INVALID = 'is not a valid 64-byte keypair array'
+/** The error for a CRANK_KEYPAIR that fails to load and does not look like a path (e.g. a key pasted in another form). */
+const NOT_A_KEYPAIR = 'CRANK_KEYPAIR is neither a readable file path nor a 64-byte JSON array'
+/** Longest CRANK_KEYPAIR an error may name as a path: a longer value is more likely a pasted key. */
+const MAX_ECHOED_PATH_LENGTH = 256
+/** A value naming a path starts with ~ or . or contains a separator (which covers a leading / or \). */
+const PATH_PREFIXES = ['~', '.'] as const
+const PATH_SEPARATOR = /[/\\]/
 
 const ENV_KEYS = [
   'CLUSTER',
@@ -103,7 +114,10 @@ const nonNegativeInteger = () =>
 
 const secretKeySchema = z.array(z.number().int().min(0).max(255)).length(SECRET_KEY_BYTES)
 
-/** CRANK_KEYPAIR holds the keypair itself (a JSON array, as ECS injects it from SSM) rather than a file path. */
+/**
+ * CRANK_KEYPAIR holds the keypair itself (a JSON array, as ECS injects it from SSM) rather than a file path. A relative
+ * path starting with `[` is therefore read as an inline array and fails closed with the inline error; prefix it with ./
+ */
 function isInlineKeypair(value: string): boolean {
   return value.trimStart().startsWith('[')
 }
@@ -119,16 +133,23 @@ function parseInlineKeypair(value: string): Keypair | undefined {
   }
 }
 
+/** Registers a loaded secret key with the log redaction as JSON.stringify and base58 (wallet exports) write it. */
+function protectSecretKey(keypair: Keypair): Keypair {
+  registerSecret(JSON.stringify(Array.from(keypair.secretKey)))
+  registerSecret(bs58.encode(keypair.secretKey))
+  return keypair
+}
+
 /**
- * Registers an inline CRANK_KEYPAIR with the log redaction, before validating it so a bad value is never logged either:
- * as given, trimmed, and (when valid) as JSON.stringify writes the secret key bytes.
+ * Registers a CRANK_KEYPAIR value with the log redaction, as given and trimmed, before anything validates or reads it:
+ * an inline array or a key pasted in another form is never logged, valid or not (a real path is redacted too). Returns
+ * the keypair of a valid inline array, whose secret key forms are registered as well.
  */
-function protectInlineKeypair(value: string): Keypair | undefined {
+function protectKeypairSource(value: string): Keypair | undefined {
   registerSecret(value)
   registerSecret(value.trim())
-  const keypair = parseInlineKeypair(value)
-  if (keypair !== undefined) registerSecret(JSON.stringify(Array.from(keypair.secretKey)))
-  return keypair
+  const keypair = isInlineKeypair(value) ? parseInlineKeypair(value) : undefined
+  return keypair === undefined ? undefined : protectSecretKey(keypair)
 }
 
 const envSchema = z.object({
@@ -207,12 +228,11 @@ function scrub(text: string, secret: string | undefined): string {
 
 /**
  * Validates the worker env. Throws an Error naming each bad variable, never including the RPC_URL value or an inline
- * CRANK_KEYPAIR (registered with the log redaction first, valid or not).
+ * CRANK_KEYPAIR. A CRANK_KEYPAIR value is registered with the log redaction first, valid or not.
  */
 export function loadConfig(env: NodeJS.ProcessEnv): WorkerConfig {
   const picked = pickEnv(env)
-  const keypairSource = picked.CRANK_KEYPAIR
-  if (keypairSource !== undefined && isInlineKeypair(keypairSource)) protectInlineKeypair(keypairSource)
+  if (picked.CRANK_KEYPAIR !== undefined) protectKeypairSource(picked.CRANK_KEYPAIR)
   const parsed = envSchema.safeParse(picked)
   if (!parsed.success) {
     const problems = parsed.error.issues.map((issue) => `${issue.path.join('.')} ${issue.message}`).join('; ')
@@ -253,18 +273,23 @@ function parseKeypairJson(raw: string, path: string): unknown {
 
 /** An inline keypair array, registered with the log redaction. The error never echoes the value. */
 function loadInlineKeypair(value: string): Keypair {
-  const keypair = protectInlineKeypair(value)
+  const keypair = protectKeypairSource(value)
   if (keypair === undefined) throw new Error(`CRANK_KEYPAIR ${INLINE_KEYPAIR_INVALID}`)
   return keypair
 }
 
 /**
- * Loads the crank keypair from `source`: the 64-byte JSON array itself when it starts with `[` (CRANK_KEYPAIR injected
- * from SSM), otherwise a solana-keygen JSON keypair file. Errors name the path only, never the array or the file contents.
+ * Whether an error may name `source`: only a value that looks like a path (starts with ~ / . or \, or contains a
+ * separator) of at most 256 characters. A key pasted in another form (base58, a quoted array, {"secretKey":[...]},
+ * hex) does not, so it is never echoed.
  */
-export function loadCrankKeypair(source: string): Keypair {
-  if (isInlineKeypair(source)) return loadInlineKeypair(source)
-  const resolved = expandHome(source)
+function looksLikePath(source: string): boolean {
+  if (source.length > MAX_ECHOED_PATH_LENGTH) return false
+  return PATH_PREFIXES.some((prefix) => source.startsWith(prefix)) || PATH_SEPARATOR.test(source)
+}
+
+/** A solana-keygen JSON keypair file. Errors name the path only, never the file contents. */
+function loadKeypairFile(resolved: string): Keypair {
   const json = parseKeypairJson(readKeypairFile(resolved), resolved)
   const secret = secretKeySchema.safeParse(json)
   if (!secret.success) {
@@ -274,5 +299,22 @@ export function loadCrankKeypair(source: string): Keypair {
     return Keypair.fromSecretKey(Uint8Array.from(secret.data))
   } catch {
     throw new Error(`Crank keypair file ${resolved} does not hold a valid ed25519 secret key`)
+  }
+}
+
+/**
+ * Loads the crank keypair from `source`: the 64-byte JSON array itself when it starts with `[` (CRANK_KEYPAIR injected
+ * from SSM), otherwise a solana-keygen JSON keypair file. A relative path starting with `[` is read as an array and
+ * fails closed. The value is registered with the log redaction before it is read, and so is the loaded secret key.
+ * Errors never include the array or the file contents, and name the path only when the value looks like one.
+ */
+export function loadCrankKeypair(source: string): Keypair {
+  if (isInlineKeypair(source)) return loadInlineKeypair(source)
+  protectKeypairSource(source)
+  try {
+    return protectSecretKey(loadKeypairFile(expandHome(source)))
+  } catch (err) {
+    if (looksLikePath(source)) throw err
+    throw new Error(NOT_A_KEYPAIR)
   }
 }
