@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import { Keypair } from '@solana/web3.js'
 import type { QuoteMintInfo, QuoteSymbol } from '@trucee/sdk'
 import { z } from 'zod'
+import { registerSecret } from './log.js'
 
 const CLUSTERS = ['devnet', 'mainnet-beta', 'localnet'] as const
 export type WorkerCluster = (typeof CLUSTERS)[number]
@@ -41,6 +42,11 @@ export interface QuoteMinimums {
 export interface WorkerConfig extends CrankGuards {
   cluster: WorkerCluster
   rpcUrl: string
+  /**
+   * What loadCrankKeypair reads the crank keypair from: a solana-keygen file path (~ expanded), or the 64-byte JSON array
+   * itself when CRANK_KEYPAIR holds the keypair (ECS injects it from SSM). That array is a secret: loadConfig registers it
+   * with the log redaction.
+   */
   crankKeypairPath: string
   crankIntervalMs: number
   maxTxPerTick: number
@@ -66,6 +72,8 @@ const XSTOCK_MINIMUMS: QuoteMinimums = Object.freeze({ ataValue: 10_000_000n, mi
 const MIN_CRANK_INTERVAL_MS = 100
 /** solana-keygen files hold the 64-byte ed25519 secret key as a JSON array of numbers. */
 const SECRET_KEY_BYTES = 64
+/** The only error an inline CRANK_KEYPAIR ever produces: it must never echo the value. */
+const INLINE_KEYPAIR_INVALID = 'is not a valid 64-byte keypair array'
 
 const ENV_KEYS = [
   'CLUSTER',
@@ -93,6 +101,36 @@ const nonNegativeInteger = () =>
     .refine(Number.isSafeInteger, NON_NEGATIVE_INTEGER)
     .optional()
 
+const secretKeySchema = z.array(z.number().int().min(0).max(255)).length(SECRET_KEY_BYTES)
+
+/** CRANK_KEYPAIR holds the keypair itself (a JSON array, as ECS injects it from SSM) rather than a file path. */
+function isInlineKeypair(value: string): boolean {
+  return value.trimStart().startsWith('[')
+}
+
+/** The keypair in an inline CRANK_KEYPAIR, or undefined unless it is 64 integers 0..255 forming an ed25519 secret key. */
+function parseInlineKeypair(value: string): Keypair | undefined {
+  try {
+    const secret = secretKeySchema.safeParse(JSON.parse(value))
+    return secret.success ? Keypair.fromSecretKey(Uint8Array.from(secret.data)) : undefined
+  } catch {
+    // The JSON.parse message quotes the input, so no message is kept.
+    return undefined
+  }
+}
+
+/**
+ * Registers an inline CRANK_KEYPAIR with the log redaction, before validating it so a bad value is never logged either:
+ * as given, trimmed, and (when valid) as JSON.stringify writes the secret key bytes.
+ */
+function protectInlineKeypair(value: string): Keypair | undefined {
+  registerSecret(value)
+  registerSecret(value.trim())
+  const keypair = parseInlineKeypair(value)
+  if (keypair !== undefined) registerSecret(JSON.stringify(Array.from(keypair.secretKey)))
+  return keypair
+}
+
 const envSchema = z.object({
   CLUSTER: z.enum(CLUSTERS, {
     error: (issue) => (issue.input === undefined ? 'is required' : `must be one of ${CLUSTERS.join(', ')}`),
@@ -102,7 +140,13 @@ const envSchema = z.object({
     protocol: /^https?$/,
     error: (issue) => (issue.input === undefined ? 'is required' : 'must be an http(s) URL'),
   }),
-  CRANK_KEYPAIR: z.string().default(DEFAULT_CRANK_KEYPAIR),
+  // Blank means unset (the default file). An inline keypair array is validated here, and the message never echoes it.
+  CRANK_KEYPAIR: z
+    .string()
+    .trim()
+    .transform((value) => (value === '' ? DEFAULT_CRANK_KEYPAIR : value))
+    .refine((value) => !isInlineKeypair(value) || parseInlineKeypair(value) !== undefined, INLINE_KEYPAIR_INVALID)
+    .default(DEFAULT_CRANK_KEYPAIR),
   CRANK_INTERVAL_MS: z.coerce
     .number({ error: 'must be an integer number of milliseconds' })
     .int('must be an integer number of milliseconds')
@@ -161,9 +205,15 @@ function scrub(text: string, secret: string | undefined): string {
   return secret === undefined || secret === '' ? text : text.split(secret).join('[redacted]')
 }
 
-/** Validates the worker env. Throws an Error naming each bad variable, never including the RPC_URL value. */
+/**
+ * Validates the worker env. Throws an Error naming each bad variable, never including the RPC_URL value or an inline
+ * CRANK_KEYPAIR (registered with the log redaction first, valid or not).
+ */
 export function loadConfig(env: NodeJS.ProcessEnv): WorkerConfig {
-  const parsed = envSchema.safeParse(pickEnv(env))
+  const picked = pickEnv(env)
+  const keypairSource = picked.CRANK_KEYPAIR
+  if (keypairSource !== undefined && isInlineKeypair(keypairSource)) protectInlineKeypair(keypairSource)
+  const parsed = envSchema.safeParse(picked)
   if (!parsed.success) {
     const problems = parsed.error.issues.map((issue) => `${issue.path.join('.')} ${issue.message}`).join('; ')
     throw new Error(scrub(`Invalid worker config: ${problems}`, env.RPC_URL))
@@ -173,7 +223,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): WorkerConfig {
   return Object.freeze({
     cluster: data.CLUSTER,
     rpcUrl: data.RPC_URL,
-    crankKeypairPath: expandHome(data.CRANK_KEYPAIR),
+    crankKeypairPath: isInlineKeypair(data.CRANK_KEYPAIR) ? data.CRANK_KEYPAIR : expandHome(data.CRANK_KEYPAIR),
     crankIntervalMs: data.CRANK_INTERVAL_MS,
     maxTxPerTick: data.MAX_TX_PER_TICK,
     minAtaValueLamports: lamportsOr(data.MIN_ATA_VALUE_LAMPORTS, defaults.minAtaValueLamports),
@@ -182,8 +232,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): WorkerConfig {
     minMigrateThresholdSolLamports: lamportsOr(data.MIN_MIGRATE_THRESHOLD_SOL_LAMPORTS, defaults.minMigrateThresholdSolLamports),
   })
 }
-
-const secretKeySchema = z.array(z.number().int().min(0).max(255)).length(SECRET_KEY_BYTES)
 
 function readKeypairFile(path: string): string {
   try {
@@ -203,9 +251,20 @@ function parseKeypairJson(raw: string, path: string): unknown {
   }
 }
 
-/** Reads a solana-keygen JSON keypair file. Errors name the path only, never the file contents. */
-export function loadCrankKeypair(path: string): Keypair {
-  const resolved = expandHome(path)
+/** An inline keypair array, registered with the log redaction. The error never echoes the value. */
+function loadInlineKeypair(value: string): Keypair {
+  const keypair = protectInlineKeypair(value)
+  if (keypair === undefined) throw new Error(`CRANK_KEYPAIR ${INLINE_KEYPAIR_INVALID}`)
+  return keypair
+}
+
+/**
+ * Loads the crank keypair from `source`: the 64-byte JSON array itself when it starts with `[` (CRANK_KEYPAIR injected
+ * from SSM), otherwise a solana-keygen JSON keypair file. Errors name the path only, never the array or the file contents.
+ */
+export function loadCrankKeypair(source: string): Keypair {
+  if (isInlineKeypair(source)) return loadInlineKeypair(source)
+  const resolved = expandHome(source)
   const json = parseKeypairJson(readKeypairFile(resolved), resolved)
   const secret = secretKeySchema.safeParse(json)
   if (!secret.success) {

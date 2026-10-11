@@ -12,6 +12,11 @@ const SECRET = 'SECRETKEY'
 const SECRET_RPC_URL = `https://example.invalid/v2/${SECRET}`
 const LOCAL_RPC_URL = 'http://127.0.0.1:8899'
 const TEST_INTERVAL_MS = 5
+const INVALID_INLINE_KEYPAIR = 'CRANK_KEYPAIR is not a valid 64-byte keypair array'
+const DEFAULT_KEYPAIR_PATH = join(homedir(), '.config', 'solana', 'id.json')
+
+/** The keypair as solana-keygen writes it and as SSM injects it into CRANK_KEYPAIR on ECS. */
+const inlineKeypair = (kp: Keypair): string => JSON.stringify(Array.from(kp.secretKey))
 
 type LogEntry = Record<string, unknown>
 
@@ -95,7 +100,7 @@ describe('loadConfig', () => {
     expect(cfg).toEqual<WorkerConfig>({
       cluster: 'devnet',
       rpcUrl: SECRET_RPC_URL,
-      crankKeypairPath: join(homedir(), '.config', 'solana', 'id.json'),
+      crankKeypairPath: DEFAULT_KEYPAIR_PATH,
       crankIntervalMs: 15000,
       maxTxPerTick: 10,
       minAtaValueLamports: 250_000_000n,
@@ -215,6 +220,104 @@ describe('loadCrankKeypair', () => {
       expect(text).toMatch(/crank keypair/i)
       expect(text).not.toContain(SECRET)
       expect(text).not.toContain('1,2,3')
+    }
+  })
+})
+
+describe('CRANK_KEYPAIR inline keypair (CRK-12)', () => {
+  const base = { CLUSTER: 'devnet', RPC_URL: SECRET_RPC_URL }
+
+  /** Inline values that are not a valid keypair, each built from a real secret key so a leak would be visible. */
+  function badInlineValues(): ReadonlyArray<readonly [string, string]> {
+    const bytes = Array.from(Keypair.generate().secretKey)
+    const otherPublicKey = Array.from(Keypair.generate().publicKey.toBytes())
+    return [
+      ['63 numbers', JSON.stringify(bytes.slice(0, 63))],
+      ['65 numbers', JSON.stringify([...bytes, 7])],
+      ['a value above 255', JSON.stringify([256, ...bytes.slice(1)])],
+      ['a negative value', JSON.stringify([-1, ...bytes.slice(1)])],
+      ['a float', JSON.stringify([1.5, ...bytes.slice(1)])],
+      ['a string element', JSON.stringify([String(bytes[0]), ...bytes.slice(1)])],
+      ['bad JSON', `[${bytes.join(',')}`],
+      ['the public half of another key', JSON.stringify([...bytes.slice(0, 32), ...otherPublicKey])],
+    ]
+  }
+
+  it('loads the keypair from an inline 64-byte JSON array, with or without whitespace', () => {
+    const kp = Keypair.generate()
+    const inline = inlineKeypair(kp)
+    const values = [inline, ` ${inline}\n`, JSON.stringify(Array.from(kp.secretKey), null, 1)]
+
+    for (const value of values) {
+      const cfg = loadConfig({ ...base, CRANK_KEYPAIR: value })
+
+      expect(loadCrankKeypair(cfg.crankKeypairPath).publicKey.toBase58()).toBe(kp.publicKey.toBase58())
+      expect(loadCrankKeypair(value).publicKey.toBase58()).toBe(kp.publicKey.toBase58())
+    }
+  })
+
+  it('rejects a bad inline array with the generic error and never echoes the value', () => {
+    for (const [label, value] of badInlineValues()) {
+      const configText = thrownText(() => loadConfig({ ...base, CRANK_KEYPAIR: value }))
+      const loadText = thrownText(() => loadCrankKeypair(value))
+
+      expect(configText, label).toContain(INVALID_INLINE_KEYPAIR)
+      expect(() => loadCrankKeypair(value), label).toThrow(new Error(INVALID_INLINE_KEYPAIR))
+      for (const text of [configText, loadText]) {
+        expect(text, label).not.toContain(value)
+        expect(text, label).not.toContain(value.slice(1, 24))
+      }
+    }
+  })
+
+  it('reports a bad inline array alongside the other config problems', () => {
+    const [, value] = badInlineValues()[0] ?? ['', '']
+
+    const text = thrownText(() => loadConfig({ ...base, CLUSTER: 'testnet', CRANK_KEYPAIR: value }))
+
+    expect(text).toContain(INVALID_INLINE_KEYPAIR)
+    expect(text).toMatch(/CLUSTER must be one of/)
+    expect(text).not.toContain(value.slice(1, 24))
+  })
+
+  it('registers the inline value with the log redaction, valid or not, in every form it may be logged', () => {
+    const kp = Keypair.generate()
+    const spaced = JSON.stringify(Array.from(kp.secretKey), null, 1)
+    const malformed = badInlineValues().map(([, value]) => value)
+    const cfg = loadConfig({ ...base, CRANK_KEYPAIR: `${spaced}\n` })
+    for (const value of malformed) expect(() => loadConfig({ ...base, CRANK_KEYPAIR: value })).toThrow(INVALID_INLINE_KEYPAIR)
+    const out = captureStdout()
+
+    log.info('config', { cfg, raw: `${spaced}\n` })
+    log.info('bytes', { bytes: Array.from(kp.secretKey), text: inlineKeypair(kp) })
+    for (const value of malformed) log.error('worker failed to start', { value })
+    out.restore()
+
+    const raw = out.raw()
+    expect(raw).not.toContain(spaced)
+    expect(raw).not.toContain(JSON.stringify(spaced).slice(1, -1))
+    expect(raw).not.toContain(inlineKeypair(kp))
+    expect(raw).not.toContain(Array.from(kp.secretKey).slice(0, 8).join(','))
+    for (const value of malformed) expect(raw).not.toContain(JSON.stringify(value).slice(1, -1))
+    expect(raw).toContain('[redacted]')
+  })
+
+  it('still reads a keypair file path: trimmed, with ~ expanded, even when it contains [', () => {
+    const cfg = loadConfig({ ...base, CRANK_KEYPAIR: keypairPath })
+    const bracketed = join(tempDir, '[keys]', 'crank.json')
+
+    expect(cfg.crankKeypairPath).toBe(keypairPath)
+    expect(loadCrankKeypair(cfg.crankKeypairPath).publicKey.toBase58()).toBe(testKeypair.publicKey.toBase58())
+    expect(loadConfig({ ...base, CRANK_KEYPAIR: ` ${keypairPath}\n` }).crankKeypairPath).toBe(keypairPath)
+    expect(loadConfig({ ...base, CRANK_KEYPAIR: '~/keys/crank.json' }).crankKeypairPath).toBe(join(homedir(), 'keys', 'crank.json'))
+    expect(loadConfig({ ...base, CRANK_KEYPAIR: '~' }).crankKeypairPath).toBe(homedir())
+    expect(loadConfig({ ...base, CRANK_KEYPAIR: bracketed }).crankKeypairPath).toBe(bracketed)
+    expect(() => loadCrankKeypair(bracketed)).toThrow(`Cannot read crank keypair file ${bracketed} (ENOENT)`)
+  })
+
+  it('treats an empty or blank CRANK_KEYPAIR as unset: the default keypair file', () => {
+    for (const blank of ['', ' ', '\t\n']) {
+      expect(loadConfig({ ...base, CRANK_KEYPAIR: blank }).crankKeypairPath).toBe(DEFAULT_KEYPAIR_PATH)
     }
   })
 })
@@ -420,5 +523,27 @@ describe('startCrank', () => {
     expect(seen[0]?.payer.publicKey.toBase58()).toBe(testKeypair.publicKey.toBase58())
     expect(seen[0]?.connection.rpcEndpoint).toBe(LOCAL_RPC_URL)
     expect(seen[0]?.log).toBe(log)
+  })
+
+  it('signs with the keypair of an inline CRANK_KEYPAIR and never logs it', async () => {
+    const inline = inlineKeypair(testKeypair)
+    const { crankKeypairPath } = loadConfig({ CLUSTER: 'devnet', RPC_URL: LOCAL_RPC_URL, CRANK_KEYPAIR: inline })
+    const out = captureStdout()
+    const seen: CrankContext[] = []
+    const job: CrankJob = {
+      name: 'payer',
+      run: async (ctx) => {
+        seen.push(ctx)
+        return { sent: [], skipped: 0, errors: [] }
+      },
+    }
+
+    const crank = await startCrank(testConfig({ crankKeypairPath }), [job])
+    await vi.waitFor(() => expect(seen.length).toBeGreaterThanOrEqual(1), { timeout: 2000, interval: 5 })
+    await crank.stop()
+    out.restore()
+
+    expect(seen[0]?.payer.publicKey.toBase58()).toBe(testKeypair.publicKey.toBase58())
+    expect(out.raw()).not.toContain(inline)
   })
 })
