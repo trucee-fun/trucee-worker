@@ -35,6 +35,7 @@ import {
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token'
 import {
+  POSITION_ACCOUNT_SIZE_V2,
   claimSurplusInstruction,
   decodePosition,
   decodeTxError,
@@ -184,10 +185,15 @@ async function rpc<T>(call: Promise<T>, name: string): Promise<T> {
 
 /* ---------- reads ---------- */
 
+/**
+ * The market's current-layout Positions. The dataSize filter keeps the 89-byte pre-v5 Positions the devnet router
+ * still owns out of the scan (CRK-11): the RPC never serves them, so they are never decoded or claimed.
+ */
 function positionFilters(market: PublicKey): GetProgramAccountsFilter[] {
   return [
     { memcmp: { offset: 0, bytes: Buffer.from(POSITION_DISCRIMINATOR).toString('base64'), encoding: 'base64' } },
     { memcmp: { offset: POSITION_MARKET_OFFSET, bytes: market.toBase58() } },
+    { dataSize: POSITION_ACCOUNT_SIZE_V2 },
   ]
 }
 

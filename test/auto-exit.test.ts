@@ -12,6 +12,8 @@ import {
   TransactionMessage,
   VersionedTransaction,
   type Connection,
+  type GetProgramAccountsConfig,
+  type GetProgramAccountsFilter,
   type TransactionError,
   type TransactionInstruction,
 } from '@solana/web3.js'
@@ -51,6 +53,12 @@ import {
   planAutoExits,
   type AtaRule,
 } from '../src/crank/jobs/auto-exit.js'
+
+// decodePosition is wrapped (still the real decoder) so the CRK-11 test can see which accounts the job decodes.
+vi.mock('@trucee/sdk', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@trucee/sdk')>()
+  return { ...actual, decodePosition: vi.fn(actual.decodePosition) }
+})
 
 const cluster = getClusterConfig('localnet')
 const NOW = 1_800_000_000n
@@ -362,6 +370,8 @@ describe('planAutoExits', () => {
 const POSITION_DISCRIMINATOR = [170, 188, 143, 228, 122, 64, 247, 208]
 const MARKET_DISCRIMINATOR = [219, 190, 213, 55, 0, 227, 198, 154]
 const POSITION_SIZE = 97
+/** Pre-v5 Positions (no auto-exit deadline) the devnet router still owns (CRK-11). */
+const LEGACY_POSITION_SIZE = 89
 const MARKET_SIZE = 274
 const POOL_SIZE = 416
 const POOL_PROGRESS_OFFSET = 308
@@ -434,6 +444,9 @@ interface Chain {
 }
 
 const accountInfo = (data: Buffer, owner: PublicKey = ROUTER_PROGRAM_ID) => ({ data, owner, lamports: 1_000_000, executable: false, rentEpoch: 0 })
+/** Like an RPC node: an account is served only when its length matches every dataSize filter. */
+const matchesDataSize = (filters: readonly GetProgramAccountsFilter[], data: Buffer): boolean =>
+  filters.every((filter) => !('dataSize' in filter) || data.length === filter.dataSize)
 /** A request that never answers, for the timeout tests. */
 const hang = <T>(): Promise<T> => new Promise<T>(() => undefined)
 
@@ -443,8 +456,10 @@ function fakeConnection(chain: Chain) {
   const blockhashes: string[] = []
   const fake = {
     getBalance: vi.fn(async (_key: PublicKey, _commitment?: unknown) => chain.payerBalance ?? FUNDED_LAMPORTS),
-    getProgramAccounts: vi.fn(async (_programId: PublicKey, _config?: unknown) =>
-      chain.positions.map(({ address, data }) => ({ pubkey: address, account: accountInfo(data) })),
+    getProgramAccounts: vi.fn(async (_programId: PublicKey, config?: GetProgramAccountsConfig) =>
+      chain.positions
+        .filter(({ data }) => matchesDataSize(config?.filters ?? [], data))
+        .map(({ address, data }) => ({ pubkey: address, account: accountInfo(data) })),
     ),
     getAccountInfo: vi.fn(async (key: PublicKey, _commitment?: unknown) =>
       key.equals(SYSVAR_CLOCK_PUBKEY) && chain.clock !== null ? accountInfo(chain.clock) : null,
@@ -562,7 +577,7 @@ describe('autoExitJob', () => {
     expect(decodeMarket(market.address, encodeMarket(market))).toEqual(market)
   })
 
-  it('fetches Position accounts by discriminator, then simulates and sends one signed auto-exit transaction', async () => {
+  it('fetches Position accounts by discriminator and the 97-byte size, then simulates and sends one signed auto-exit transaction', async () => {
     const payer = Keypair.generate()
     const chain = fakeConnection(chainOf([dueEntry()]))
 
@@ -573,6 +588,7 @@ describe('autoExitJob', () => {
     expect(programId.equals(cluster.routerProgramId)).toBe(true)
     expect(config.filters).toEqual([
       { memcmp: { offset: 0, bytes: Buffer.from(POSITION_DISCRIMINATOR).toString('base64'), encoding: 'base64' } },
+      { dataSize: POSITION_SIZE },
     ])
     const tx = chain.sent[0]
     expect(signatureOf(tx)).toBe(signatureOf(chain.simulated[0])) // exactly the simulated transaction
@@ -752,7 +768,8 @@ describe('autoExitJob', () => {
 
   it('records an undecodable Position account as an error and still exits the others', async () => {
     const base = chainOf([dueEntry()])
-    const garbage = { address: randomKey(), data: Buffer.from([...POSITION_DISCRIMINATOR, 1, 2, 3]) }
+    // The fake RPC applies dataSize but not memcmp: a 97-byte account with no Position discriminator gets through.
+    const garbage = { address: randomKey(), data: Buffer.alloc(POSITION_SIZE) }
     const chain = fakeConnection({ ...base, positions: [garbage, ...base.positions] })
 
     const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
@@ -885,6 +902,19 @@ describe('autoExitJob', () => {
     })
 
     await expect(autoExitJob.run(ctx)).resolves.toEqual({ sent: [], skipped: 0, errors: [expect.stringContaining('no cluster config')] })
+  })
+
+  it('never decodes an 89-byte legacy position and still exits the current ones (CRK-11)', async () => {
+    const base = chainOf([dueEntry()])
+    const { position } = dueEntry()
+    const legacy = { address: position.address, data: Buffer.from(encodePosition(position).subarray(0, LEGACY_POSITION_SIZE)) }
+    const chain = fakeConnection({ ...base, positions: [legacy, ...base.positions] })
+    vi.mocked(decodePosition).mockClear()
+
+    const result = await autoExitJob.run(context(chain.connection, Keypair.generate()))
+
+    expect(result).toEqual({ sent: ['sig-1'], skipped: 0, errors: [] })
+    expect(vi.mocked(decodePosition).mock.calls.map(([, data]) => data.length)).toEqual([POSITION_SIZE])
   })
 })
 

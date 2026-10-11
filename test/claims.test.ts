@@ -26,6 +26,8 @@ import {
 } from '@solana/spl-token'
 import {
   claimSurplusInstruction,
+  decodePosition,
+  fetchAllMarkets,
   findBufferPda,
   findMarketPda,
   findPositionPda,
@@ -47,10 +49,16 @@ import {
   planClaims,
 } from '../src/crank/jobs/claims.js'
 
-// Only claimSurplusInstruction is wrapped (still the real builder) so one test can make it pay the wrong account.
+// Wrapped, still the real functions: one test makes claimSurplusInstruction pay the wrong account, and the CRK-11
+// tests record what decodePosition is handed and what fetchAllMarkets returns.
 vi.mock('@trucee/sdk', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@trucee/sdk')>()
-  return { ...actual, claimSurplusInstruction: vi.fn(actual.claimSurplusInstruction) }
+  return {
+    ...actual,
+    claimSurplusInstruction: vi.fn(actual.claimSurplusInstruction),
+    decodePosition: vi.fn(actual.decodePosition),
+    fetchAllMarkets: vi.fn(actual.fetchAllMarkets),
+  }
 })
 
 afterEach(() => {
@@ -66,6 +74,9 @@ const POSITION_DISCRIMINATOR = [170, 188, 143, 228, 122, 64, 247, 208]
 const CLAIM_SURPLUS_DISCRIMINATOR = [195, 35, 205, 205, 177, 146, 141, 62]
 const MARKET_SIZE = 274
 const POSITION_SIZE = 97
+/** Layouts the devnet router still owns (CRK-11): pre-v5 Markets and Positions without the auto-exit deadline. */
+const LEGACY_MARKET_SIZE = 241
+const LEGACY_POSITION_SIZE = 89
 const PUBKEY_SIZE = 32
 const POSITION_MARKET_OFFSET = 40
 const FAKE_RPC_KEY = 'FAKE-RPC-KEY-0123456789'
@@ -344,6 +355,9 @@ function encodePosition(p: PositionAccount): Buffer {
   return data
 }
 
+/** A pre-v5 account: the current encoding cut to the legacy length. */
+const truncated = (data: Buffer, size: number): Buffer => Buffer.from(data.subarray(0, size))
+
 function accountInfo(data: Buffer, owner: PublicKey): AccountInfo<Buffer> {
   return { data, owner, lamports: 1_000_000, executable: false, rentEpoch: 0 }
 }
@@ -353,6 +367,10 @@ function accountInfo(data: Buffer, owner: PublicKey): AccountInfo<Buffer> {
 interface FakeChainOptions {
   readonly markets: readonly MarketAccount[]
   readonly positions?: readonly PositionAccount[]
+  /** Markets the router still owns in the 241-byte legacy layout. */
+  readonly legacyMarkets?: readonly MarketAccount[]
+  /** Positions the router still owns in the 89-byte legacy layout. */
+  readonly legacyPositions?: readonly PositionAccount[]
   /** Quote ATAs that already exist on chain. */
   readonly existingAtas?: readonly PublicKey[]
   /** Accounts at ATA addresses owned by some other program, as [ata, owner]: not live token accounts. */
@@ -393,6 +411,17 @@ function discriminatorOf(filters: readonly GetProgramAccountsFilter[]): string {
   return [...Buffer.from(disc.bytes, 'base64')].join()
 }
 
+interface ServedAccount {
+  readonly pubkey: PublicKey
+  readonly account: AccountInfo<Buffer>
+}
+
+/** Like an RPC node: serves only the accounts whose length matches every dataSize filter. */
+function matchingDataSize<T extends ServedAccount>(filters: readonly GetProgramAccountsFilter[], accounts: readonly T[]): T[] {
+  const sizes = filters.flatMap((filter) => ('dataSize' in filter ? [filter.dataSize] : []))
+  return accounts.filter(({ account }) => sizes.every((size) => account.data.length === size))
+}
+
 function claimOwner(tx: VersionedTransaction): string | undefined {
   const instructions = TransactionMessage.decompile(tx.message).instructions
   return keyAt(instructions.find(isClaim), CLAIM_KEY.owner)
@@ -400,6 +429,21 @@ function claimOwner(tx: VersionedTransaction): string | undefined {
 
 function fakeConnection(options: FakeChainOptions) {
   const positions = options.positions ?? []
+  const marketAccounts: readonly ServedAccount[] = [
+    ...options.markets.map((m) => ({ pubkey: m.address, account: accountInfo(encodeMarket(m), ROUTER) })),
+    ...(options.legacyMarkets ?? []).map((m) => ({
+      pubkey: m.address,
+      account: accountInfo(truncated(encodeMarket(m), LEGACY_MARKET_SIZE), ROUTER),
+    })),
+  ]
+  const positionAccounts: readonly (ServedAccount & { readonly market: PublicKey })[] = [
+    ...positions.map((p) => ({ pubkey: p.address, market: p.market, account: accountInfo(encodePosition(p), ROUTER) })),
+    ...(options.legacyPositions ?? []).map((p) => ({
+      pubkey: p.address,
+      market: p.market,
+      account: accountInfo(truncated(encodePosition(p), LEGACY_POSITION_SIZE), ROUTER),
+    })),
+  ]
   const existing = new Set((options.existingAtas ?? []).map((key) => key.toBase58()))
   const foreign = new Map((options.foreignAtas ?? []).map(([ata, owner]) => [ata.toBase58(), owner]))
   let sendCount = 0
@@ -413,14 +457,13 @@ function fakeConnection(options: FakeChainOptions) {
     const discriminator = discriminatorOf(filters)
     if (discriminator === MARKET_DISCRIMINATOR.join()) {
       if (options.hangs === 'markets') return NEVER
-      return options.markets.map((m) => ({ pubkey: m.address, account: accountInfo(encodeMarket(m), ROUTER) }))
+      return matchingDataSize(filters, marketAccounts)
     }
     if (discriminator !== POSITION_DISCRIMINATOR.join()) throw new Error('unexpected getProgramAccounts filters')
     if (options.hangs === 'positions') return NEVER
     const market = memcmpAt(filters, POSITION_MARKET_OFFSET)?.bytes
-    return positions
-      .filter((p) => p.market.toBase58() === market)
-      .map((p) => ({ pubkey: p.address, account: accountInfo(encodePosition(p), ROUTER) }))
+    const ofMarket = positionAccounts.filter((p) => p.market.toBase58() === market)
+    return matchingDataSize(filters, ofMarket).map(({ pubkey, account }) => ({ pubkey, account }))
   })
   const getBalance = vi.fn(async (_key: PublicKey, _commitment?: Commitment) =>
     options.hangs === 'getBalance' ? NEVER : (options.payerBalance ?? FUNDED_LAMPORTS),
@@ -513,7 +556,7 @@ describe('claimsJob', () => {
     expect(fake.sendTransaction).not.toHaveBeenCalled()
   })
 
-  it('queries positions by the Position discriminator at 0 and the market at 40', async () => {
+  it('queries positions by the Position discriminator at 0, the market at 40 and the 97-byte size', async () => {
     const market = makeMarket()
     const fake = fakeConnection({ markets: [market] })
 
@@ -524,6 +567,7 @@ describe('claimsJob', () => {
     expect(config?.filters).toEqual([
       { memcmp: { offset: 0, bytes: Buffer.from(POSITION_DISCRIMINATOR).toString('base64'), encoding: 'base64' } },
       { memcmp: { offset: POSITION_MARKET_OFFSET, bytes: market.address.toBase58() } },
+      { dataSize: POSITION_SIZE },
     ])
   })
 
@@ -951,6 +995,60 @@ describe('claimsJob ATA rent and payer guards (CRK-10)', () => {
     expect(below!.getProgramAccounts).not.toHaveBeenCalled()
     expect([log.info, log.warn, log.error].map((fn) => fn.mock.calls.length)).toEqual([0, 1, 0])
     expect(ran.sent).toEqual(['sig-1'])
+  })
+})
+
+/*
+ * CRK-11: the devnet router still owns 241-byte Markets and 89-byte pre-v5 Positions. The fake RPC applies dataSize
+ * filters like a node, so only a scan that sends one is spared the legacy accounts.
+ */
+describe('claimsJob with legacy-size router accounts (CRK-11)', () => {
+  const marketScan = [{ memcmp: { offset: 0, bytes: Buffer.from(MARKET_DISCRIMINATOR).toString('base64'), encoding: 'base64' as const } }]
+
+  it('the fake RPC serves legacy accounts to a scan without a dataSize filter', async () => {
+    const fake = fakeConnection({ markets: [makeMarket()], legacyMarkets: [makeMarket()] })
+
+    const served = await fake.connection.getProgramAccounts(ROUTER, { filters: marketScan })
+
+    expect(served.map(({ account }) => account.data.length).sort()).toEqual([LEGACY_MARKET_SIZE, MARKET_SIZE])
+  })
+
+  it('never decodes an 89-byte legacy position and claims only the current-layout ones', async () => {
+    const market = makeMarket()
+    const current = makePosition(market)
+    const legacy = makePosition(market)
+    const existingAtas = [current, legacy].map((p) => quoteAtaOf(market, p.owner))
+    const fake = fakeConnection({ markets: [market], positions: [current], legacyPositions: [legacy], existingAtas })
+    vi.mocked(decodePosition).mockClear()
+
+    const result = await claimsJob.run(makeContext(fake, 10))
+
+    expect(result).toEqual({ sent: ['sig-1'], skipped: 0, errors: [] })
+    expect(vi.mocked(decodePosition).mock.calls.map(([, data]) => data.length)).toEqual([POSITION_SIZE])
+    expect(sentTransactions(fake).map(claimOwner)).toEqual([current.owner.toBase58()])
+  })
+
+  it('plans claims from a fetchAllMarkets result without the 241-byte legacy markets, without errors', async () => {
+    const market = makeMarket()
+    const legacy = makeMarket()
+    const position = makePosition(market)
+    const fake = fakeConnection({
+      markets: [market],
+      legacyMarkets: [legacy],
+      positions: [position, makePosition(legacy)],
+      existingAtas: [quoteAtaOf(market, position.owner)],
+    })
+    vi.mocked(fetchAllMarkets).mockClear()
+
+    const result = await claimsJob.run(makeContext(fake, 10))
+
+    const settled = vi.mocked(fetchAllMarkets).mock.settledResults
+    expect(settled.map(({ type }) => type)).toEqual(['fulfilled'])
+    const markets = settled[0]?.type === 'fulfilled' ? settled[0].value : []
+    expect(markets.map((m) => m.address.toBase58())).toEqual([market.address.toBase58()])
+    expect(fake.getProgramAccounts.mock.calls[0]?.[1]?.filters).toContainEqual({ dataSize: MARKET_SIZE })
+    expect(result).toEqual({ sent: ['sig-1'], skipped: 0, errors: [] })
+    expect(sentTransactions(fake).map(claimOwner)).toEqual([position.owner.toBase58()])
   })
 })
 

@@ -29,6 +29,7 @@ import {
 } from '@solana/web3.js'
 import { createAssociatedTokenAccountIdempotentInstruction, getAssociatedTokenAddressSync } from '@solana/spl-token'
 import {
+  POSITION_ACCOUNT_SIZE_V2,
   autoExitInstruction,
   decodeMarket,
   decodePosition,
@@ -91,6 +92,11 @@ const QUOTE_TOKEN_PROGRAMS: ReadonlyMap<string, PublicKey> = new Map(
 const POSITION_FILTER: GetProgramAccountsFilter = Object.freeze({
   memcmp: { offset: 0, bytes: Buffer.from(POSITION_DISCRIMINATOR).toString('base64'), encoding: 'base64' },
 })
+/**
+ * Current-layout Positions only. The 89-byte pre-v5 Positions the devnet router still owns (no deadline field) are
+ * never served, so they are never decoded (CRK-11).
+ */
+const POSITION_SIZE_FILTER: GetProgramAccountsFilter = Object.freeze({ dataSize: POSITION_ACCOUNT_SIZE_V2 })
 
 /** What the planner knows about owners' quote ATAs and the crank minimums of each quote mint. */
 export interface AtaRule {
@@ -290,7 +296,7 @@ function requirePlanPrograms(cluster: ClusterConfig): void {
 async function fetchDeadlinePositions(ctx: CrankContext, routerProgramId: PublicKey): Promise<Fetched<PositionAccount[]>> {
   const accounts = await rpc(
     'getProgramAccounts',
-    ctx.connection.getProgramAccounts(routerProgramId, { commitment: COMMITMENT, filters: [POSITION_FILTER] }),
+    ctx.connection.getProgramAccounts(routerProgramId, { commitment: COMMITMENT, filters: [POSITION_FILTER, POSITION_SIZE_FILTER] }),
   )
   const decoded = accounts.map(({ pubkey, account }) => {
     try {
