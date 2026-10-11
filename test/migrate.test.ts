@@ -21,7 +21,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { CrankContext } from '../src/crank/index.js'
 import {
   CONFIRM_TIMEOUT_MS,
+  MAX_ATTEMPTS_PER_TX,
   MIGRATION_PROGRESS,
+  RPC_TIMEOUT_MS,
   createMigrateJob,
   dammConfigFor,
   migrateJob,
@@ -29,6 +31,7 @@ import {
   planMigrations,
   type ConfigSnapshot,
   type LoadResult,
+  type MarketRef,
   type MigrateJobDeps,
   type MigrationTarget,
   type PoolSnapshot,
@@ -96,7 +99,7 @@ function configSnapshot(migrationFeeOption: number): ConfigSnapshot {
 }
 
 /** A migrate_damm_v2 stand-in whose instruction needs the payer and both position-NFT mints as signers. */
-function fakeMigration(payerKey: PublicKey): MigrateToDammV2Response {
+function fakeMigration(payerKey: PublicKey, dataBytes = 8): MigrateToDammV2Response {
   const firstPositionNftKeypair = Keypair.generate()
   const secondPositionNftKeypair = Keypair.generate()
   const ix = new TransactionInstruction({
@@ -106,7 +109,7 @@ function fakeMigration(payerKey: PublicKey): MigrateToDammV2Response {
       { pubkey: secondPositionNftKeypair.publicKey, isSigner: true, isWritable: true },
       { pubkey: payerKey, isSigner: true, isWritable: true },
     ],
-    data: Buffer.alloc(8),
+    data: Buffer.alloc(dataBytes),
   })
   return { transaction: new Transaction().add(ix), firstPositionNftKeypair, secondPositionNftKeypair }
 }
@@ -120,7 +123,7 @@ function stubDeps(pools: readonly PoolSnapshot[], options: StubOptions = {}): Mi
   const byPool = new Map(pools.map((pool) => [pool.pool.toBase58(), pool]))
   const configs = options.configs ?? new Map<string, ConfigSnapshot>()
   return {
-    listPools: async () => pools.map((pool) => pool.pool),
+    listMarkets: async () => pools.map((pool) => ({ pool: pool.pool, config: pool.config })),
     fetchPools: async (_ctx, addresses) =>
       addresses.map((address) => {
         const pool = byPool.get(address.toBase58())
@@ -154,6 +157,25 @@ function mockSendPath(connection: Connection, simulationErr: SimulatedTransactio
 
 function errorLines(lines: readonly LogLine[]): LogLine[] {
   return lines.filter((line) => line.level === 'error')
+}
+
+/** A promise that never settles: a hung RPC call. */
+const hang = <T>(): Promise<T> => new Promise<T>(() => undefined)
+
+/**
+ * Runs `run` under fake timers: waits until `stalled` has been called (the hung call), then advances the clock by
+ * `ms` so the job's timeout fires, and returns the job's result.
+ */
+async function runPastTimeout<T>(run: () => Promise<T>, stalled: { mock: { calls: unknown[] } }, ms: number): Promise<T> {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  try {
+    const pending = run()
+    await vi.waitFor(() => expect(stalled.mock.calls.length).toBeGreaterThan(0))
+    await vi.advanceTimersByTimeAsync(ms)
+    return await pending
+  } finally {
+    vi.useRealTimers()
+  }
 }
 
 afterEach(() => {
@@ -431,12 +453,12 @@ describe('migrate job run', () => {
     const buildMigration = vi.fn(async () => {
       throw new Error(`failed to get info about account: request to ${rpcUrl} failed`)
     })
-    const listPools = vi.fn(async (): Promise<readonly PublicKey[]> => {
+    const listMarkets = vi.fn(async (): Promise<readonly MarketRef[]> => {
       throw new Error(`429 from ${rpcUrl}?api-key=${fakeKey}`)
     })
 
     const clientError = await createMigrateJob(stubDeps([pool], { configs, overrides: { buildMigration } })).run(testContext())
-    const loadError = await createMigrateJob(stubDeps([], { overrides: { listPools } })).run(testContext())
+    const loadError = await createMigrateJob(stubDeps([], { overrides: { listMarkets } })).run(testContext())
 
     expect(clientError.errors).toHaveLength(1)
     expect(loadError.errors).toHaveLength(1)
@@ -447,12 +469,7 @@ describe('migrate job run', () => {
   })
 
   describe('confirmation timeout', () => {
-    afterEach(() => {
-      vi.useRealTimers()
-    })
-
     async function runWithHungConfirmation(stateAfterSend: PoolSnapshot['state']) {
-      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
       const config = newKey()
       const ready = poolSnapshot(LOCKED_VESTING, false, config)
       const fetchPools = vi
@@ -462,22 +479,22 @@ describe('migrate job run', () => {
       const configs = new Map([[config.toBase58(), configSnapshot(0)]])
       const connection = new Connection(LOCAL_RPC_URL)
       const rpc = mockSendPath(connection)
-      rpc.confirm.mockReturnValue(new Promise(() => undefined))
+      rpc.confirm.mockReturnValue(hang())
       const { logger, lines } = recordingLogger()
+      const job = createMigrateJob(stubDeps([ready], { configs, overrides: { fetchPools } }))
 
-      const pending = createMigrateJob(stubDeps([ready], { configs, overrides: { fetchPools } })).run(
-        testContext({ connection, logger }),
-      )
-      await vi.waitFor(() => expect(rpc.confirm).toHaveBeenCalled())
-      await vi.advanceTimersByTimeAsync(CONFIRM_TIMEOUT_MS)
-      const result = await pending
+      const result = await runPastTimeout(() => job.run(testContext({ connection, logger })), rpc.confirm, CONFIRM_TIMEOUT_MS)
       return { result, rpc, lines, fetchPools }
     }
 
-    it('logs the outcome as unknown after the timeout and does not resend in the same tick', async () => {
+    it('reports an unknown outcome in errors (not sent) and does not resend in the same tick', async () => {
       const { result, rpc, lines } = await runWithHungConfirmation({ migrationProgress: LOCKED_VESTING, isMigrated: false })
 
-      expect(result).toEqual({ sent: [SIGNATURE], skipped: 0, errors: [] })
+      expect(result.sent).toEqual([])
+      expect(result.skipped).toBe(0)
+      expect(result.errors).toHaveLength(1)
+      expect(result.errors[0]).toContain(SIGNATURE)
+      expect(result.errors[0]).toContain('outcome unknown, will re-check next tick')
       expect(rpc.send).toHaveBeenCalledTimes(1)
       expect(errorLines(lines)).toEqual([])
       expect(lines.some((line) => line.level === 'warn' && /unknown/.test(line.msg) && line.ctx.signature === SIGNATURE)).toBe(true)
@@ -486,18 +503,159 @@ describe('migrate job run', () => {
     it('treats the pool as migrated when the re-read shows CreatedPool', async () => {
       const { result, lines, fetchPools } = await runWithHungConfirmation({ migrationProgress: CREATED_POOL, isMigrated: false })
 
-      expect(result).toEqual({ sent: [SIGNATURE], skipped: 0, errors: [] })
+      expect(result).toEqual({ sent: [], skipped: 1, errors: [] })
       expect(fetchPools).toHaveBeenCalledTimes(2)
       expect(lines.filter((line) => line.level !== 'info')).toEqual([])
     })
   })
 
+  describe('hung RPC calls', () => {
+    function readyJob(overrides: Partial<MigrateJobDeps> = {}) {
+      const config = newKey()
+      const pool = poolSnapshot(LOCKED_VESTING, false, config)
+      const configs = new Map([[config.toBase58(), configSnapshot(0)]])
+      return { pool, job: createMigrateJob(stubDeps([pool], { configs, overrides })) }
+    }
+
+    it('gives up on a hung simulateTransaction after RPC_TIMEOUT_MS and sends nothing', async () => {
+      const { pool, job } = readyJob()
+      const connection = new Connection(LOCAL_RPC_URL)
+      const rpc = mockSendPath(connection)
+      rpc.simulate.mockReturnValue(hang())
+
+      const result = await runPastTimeout(() => job.run(testContext({ connection })), rpc.simulate, RPC_TIMEOUT_MS)
+
+      expect(result.sent).toEqual([])
+      expect(result.errors).toEqual([expect.stringContaining(`simulateTransaction timed out after ${RPC_TIMEOUT_MS} ms`)])
+      expect(result.errors[0]).toContain(pool.pool.toBase58())
+      expect(rpc.send).not.toHaveBeenCalled()
+    })
+
+    it('gives up on a hung sendRawTransaction and does not retry it in the same tick', async () => {
+      const { job } = readyJob()
+      const connection = new Connection(LOCAL_RPC_URL)
+      const rpc = mockSendPath(connection)
+      rpc.send.mockReturnValue(hang())
+
+      const result = await runPastTimeout(() => job.run(testContext({ connection })), rpc.send, RPC_TIMEOUT_MS)
+
+      expect(result.sent).toEqual([])
+      expect(result.errors).toEqual([expect.stringContaining('sendRawTransaction timed out')])
+      expect(rpc.send).toHaveBeenCalledTimes(1)
+      expect(rpc.confirm).not.toHaveBeenCalled()
+    })
+
+    it('gives up on a hung DBC client build', async () => {
+      const buildMigration = vi.fn((): Promise<MigrateToDammV2Response> => hang())
+      const { job } = readyJob({ buildMigration })
+      const connection = new Connection(LOCAL_RPC_URL)
+      const rpc = mockSendPath(connection)
+
+      const result = await runPastTimeout(() => job.run(testContext({ connection })), buildMigration, RPC_TIMEOUT_MS)
+
+      expect(result.errors).toEqual([expect.stringContaining('building the migration timed out')])
+      expect(rpc.simulate).not.toHaveBeenCalled()
+    })
+
+    it('gives up on a hung re-read after a failed simulation', async () => {
+      const config = newKey()
+      const ready = poolSnapshot(LOCKED_VESTING, false, config)
+      const fetchPools = vi
+        .fn<MigrateJobDeps['fetchPools']>()
+        .mockResolvedValueOnce([ok(ready)])
+        .mockReturnValueOnce(hang())
+      const configs = new Map([[config.toBase58(), configSnapshot(0)]])
+      const job = createMigrateJob(stubDeps([ready], { configs, overrides: { fetchPools } }))
+      const connection = new Connection(LOCAL_RPC_URL)
+      const rpc = mockSendPath(connection, { InstructionError: [0, { Custom: 6000 }] })
+      const { logger, lines } = recordingLogger()
+
+      const result = await runPastTimeout(() => job.run(testContext({ connection, logger })), rpc.simulate, RPC_TIMEOUT_MS)
+
+      expect(result.errors).toEqual([expect.stringContaining('simulation failed')])
+      expect(errorLines(lines)[0]?.ctx.recheck).toMatch(/re-reading the pool timed out/)
+    })
+  })
+
+  it('caps attempts per tick at ctx.maxTx * MAX_ATTEMPTS_PER_TX, counting failed attempts, and skips the rest', async () => {
+    const config = newKey()
+    const pools = Array.from({ length: 5 }, () => poolSnapshot(LOCKED_VESTING, false, config))
+    const configs = new Map([[config.toBase58(), configSnapshot(0)]])
+    const buildMigration = vi.fn(async (ctx: CrankContext) => fakeMigration(ctx.payer.publicKey))
+    const connection = new Connection(LOCAL_RPC_URL)
+    const rpc = mockSendPath(connection, { InstructionError: [0, { Custom: 6000 }] })
+
+    const result = await createMigrateJob(stubDeps(pools, { configs, overrides: { buildMigration } })).run(
+      testContext({ connection, maxTx: 1 }),
+    )
+
+    expect(MAX_ATTEMPTS_PER_TX).toBe(3)
+    expect(buildMigration).toHaveBeenCalledTimes(3)
+    expect(rpc.simulate).toHaveBeenCalledTimes(3)
+    expect(rpc.send).not.toHaveBeenCalled()
+    expect(result.errors).toHaveLength(3)
+    expect(result.skipped).toBe(2)
+  })
+
+  it('counts a failed build as an attempt', async () => {
+    const config = newKey()
+    const pools = Array.from({ length: 4 }, () => poolSnapshot(LOCKED_VESTING, false, config))
+    const configs = new Map([[config.toBase58(), configSnapshot(0)]])
+    const buildMigration = vi.fn(async (): Promise<MigrateToDammV2Response> => {
+      throw new Error('rpc down')
+    })
+
+    const result = await createMigrateJob(stubDeps(pools, { configs, overrides: { buildMigration } })).run(testContext({ maxTx: 1 }))
+
+    expect(buildMigration).toHaveBeenCalledTimes(3)
+    expect(result).toMatchObject({ sent: [], skipped: 1 })
+    expect(result.errors).toHaveLength(3)
+  })
+
+  it('skips with a warning a pool whose config differs from its router market config', async () => {
+    const pool = poolSnapshot(LOCKED_VESTING, false)
+    const listMarkets = vi.fn(async (): Promise<readonly MarketRef[]> => [{ pool: pool.pool, config: newKey() }])
+    const buildMigration = vi.fn(async (ctx: CrankContext) => fakeMigration(ctx.payer.publicKey))
+    const configs = new Map([[pool.config.toBase58(), configSnapshot(0)]])
+    const { logger, lines } = recordingLogger()
+
+    const result = await createMigrateJob(stubDeps([pool], { configs, overrides: { listMarkets, buildMigration } })).run(
+      testContext({ logger }),
+    )
+
+    expect(result).toEqual({ sent: [], skipped: 1, errors: [] })
+    expect(buildMigration).not.toHaveBeenCalled()
+    expect(lines.filter((line) => line.level === 'warn')).toHaveLength(1)
+    expect(lines[0]?.ctx).toMatchObject({ pool: pool.pool.toBase58(), poolConfig: pool.config.toBase58() })
+  })
+
+  it.each([
+    { name: 'signed transaction over the packet size', dataBytes: 900 },
+    { name: 'message that overflows while serializing', dataBytes: 4000 },
+  ])('reports an oversized migration ($name) clearly and sends nothing', async ({ dataBytes }) => {
+    const config = newKey()
+    const pool = poolSnapshot(LOCKED_VESTING, false, config)
+    const configs = new Map([[config.toBase58(), configSnapshot(0)]])
+    const buildMigration = async (ctx: CrankContext): Promise<MigrateToDammV2Response> =>
+      fakeMigration(ctx.payer.publicKey, dataBytes)
+    const connection = new Connection(LOCAL_RPC_URL)
+    const rpc = mockSendPath(connection)
+
+    const result = await createMigrateJob(stubDeps([pool], { configs, overrides: { buildMigration } })).run(
+      testContext({ connection }),
+    )
+
+    expect(result.errors).toEqual([expect.stringMatching(/migration transaction is too large to send .*limit is 1232 bytes/)])
+    expect(rpc.simulate).not.toHaveBeenCalled()
+    expect(rpc.send).not.toHaveBeenCalled()
+  })
+
   it('returns errors instead of throwing when loading the pools fails', async () => {
-    const listPools = vi.fn(async (): Promise<readonly PublicKey[]> => {
+    const listMarkets = vi.fn(async (): Promise<readonly MarketRef[]> => {
       throw new Error('getProgramAccounts failed')
     })
 
-    const result = await createMigrateJob(stubDeps([], { overrides: { listPools } })).run(testContext())
+    const result = await createMigrateJob(stubDeps([], { overrides: { listMarkets } })).run(testContext())
 
     expect(result).toEqual({ sent: [], skipped: 0, errors: [expect.stringContaining('getProgramAccounts failed')] })
   })
@@ -578,10 +736,13 @@ describe('migrate job default loaders (decoded DBC accounts)', () => {
     return { data, owner, executable: false, lamports: 1_000_000, rentEpoch: 0 }
   }
 
-  /** Serves one router market per pool and the given DBC accounts; every other address is missing. */
-  function mockChain(connection: Connection, pools: readonly PublicKey[], dbcAccounts: ReadonlyMap<string, Buffer>) {
+  /** Serves the given router markets and DBC accounts; every other address is missing. */
+  function mockChain(connection: Connection, markets: readonly MarketRef[], dbcAccounts: ReadonlyMap<string, Buffer>) {
     vi.spyOn(connection, 'getProgramAccounts').mockResolvedValue(
-      pools.map((pool) => ({ pubkey: newKey(), account: accountInfo(encodeMarket(pool, newKey()), CLUSTER.routerProgramId) })),
+      markets.map((market) => ({
+        pubkey: newKey(),
+        account: accountInfo(encodeMarket(market.pool, market.config), CLUSTER.routerProgramId),
+      })),
     )
     return vi.spyOn(connection, 'getMultipleAccountsInfo').mockImplementation(async (keys) =>
       keys.map((key) => {
@@ -599,9 +760,10 @@ describe('migrate job default loaders (decoded DBC accounts)', () => {
 
   it('sends nothing for a pool whose progress byte is CreatedPool, even with is_migrated unset', async () => {
     const pool = newKey()
+    const config = newKey()
     const connection = new Connection(LOCAL_RPC_URL)
-    const accounts = new Map([[pool.toBase58(), await encodePool(newKey(), newKey(), CREATED_POOL, 0)]])
-    mockChain(connection, [pool], accounts)
+    const accounts = new Map([[pool.toBase58(), await encodePool(config, newKey(), CREATED_POOL, 0)]])
+    mockChain(connection, [{ pool, config }], accounts)
     const rpc = mockSendPath(connection)
     const { logger, lines } = recordingLogger()
 
@@ -625,7 +787,14 @@ describe('migrate job default loaders (decoded DBC accounts)', () => {
       [configA.toBase58(), encodeConfig(quoteMint, 0)],
       [configB.toBase58(), encodeConfig(quoteMint, 6)],
     ])
-    mockChain(connection, [poolA, poolB], accounts)
+    mockChain(
+      connection,
+      [
+        { pool: poolA, config: configA },
+        { pool: poolB, config: configB },
+      ],
+      accounts,
+    )
     mockSendPath(connection)
     const buildMigration = vi.fn(async (ctx: CrankContext, _target: MigrationTarget) => fakeMigration(ctx.payer.publicKey))
 
@@ -660,5 +829,25 @@ describe('migrate job default loaders (decoded DBC accounts)', () => {
     const result = await migrateJob.run(testContext({ connection }))
 
     expect(result).toEqual({ sent: [], skipped: 0, errors: [expect.stringContaining('429 Too Many Requests')] })
+  })
+
+  it('gives up on a hung market scan after RPC_TIMEOUT_MS', async () => {
+    const connection = new Connection(LOCAL_RPC_URL)
+    const scan = vi.spyOn(connection, 'getProgramAccounts').mockReturnValue(hang())
+
+    const result = await runPastTimeout(() => migrateJob.run(testContext({ connection })), scan, RPC_TIMEOUT_MS)
+
+    expect(result).toEqual({ sent: [], skipped: 0, errors: [expect.stringContaining('fetching router markets timed out')] })
+  })
+
+  it('gives up on a hung pool read after RPC_TIMEOUT_MS', async () => {
+    const pool = newKey()
+    const connection = new Connection(LOCAL_RPC_URL)
+    mockChain(connection, [{ pool, config: newKey() }], new Map())
+    const read = vi.spyOn(connection, 'getMultipleAccountsInfo').mockReturnValue(hang())
+
+    const result = await runPastTimeout(() => migrateJob.run(testContext({ connection })), read, RPC_TIMEOUT_MS)
+
+    expect(result).toEqual({ sent: [], skipped: 0, errors: [expect.stringContaining('getMultipleAccountsInfo timed out')] })
   })
 })

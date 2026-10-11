@@ -7,11 +7,16 @@
  * keypairs only sign the transaction; they are never logged.
  *
  * Keeper race: someone else may migrate a pool between our read and our send. The job does not parse program errors
- * to detect that. After a failed simulation, a failed transaction or a confirmation timeout it re-reads the pool; if
- * the pool is now migrated (is_migrated set, or migration_progress, byte 308, is CreatedPool) the pool is done and the
- * job logs info instead of an error.
+ * to detect that. After a failed simulation, a failed send or transaction, or a confirmation timeout it re-reads the
+ * pool; if the pool is now migrated (is_migrated set, or migration_progress, byte 308, is CreatedPool) the pool is
+ * done and the job logs info instead of an error.
+ *
+ * Bounds: the tick runner has no timeout of its own, so every RPC call (and building a migration) gives up after
+ * RPC_TIMEOUT_MS, a confirmation after CONFIRM_TIMEOUT_MS, and at most ctx.maxTx * MAX_ATTEMPTS_PER_TX pools are
+ * attempted per tick.
  */
 import {
+  PACKET_DATA_SIZE,
   TransactionMessage,
   VersionedTransaction,
   type AccountInfo,
@@ -38,8 +43,14 @@ const COMMITMENT = 'confirmed'
 const MAX_ACCOUNTS_PER_REQUEST = 100
 /** Trailing program log lines kept from a failed simulation. */
 const LOG_TAIL_LINES = 10
+/** Wall-clock bound on one RPC call or on building one migration. */
+export const RPC_TIMEOUT_MS = 30_000
 /** Wall-clock bound on waiting for a confirmation; after it the outcome is unknown until the next tick re-reads the pool. */
 export const CONFIRM_TIMEOUT_MS = 45_000
+/** A tick attempts at most ctx.maxTx * MAX_ATTEMPTS_PER_TX pools, whether or not an attempt sends a transaction. */
+export const MAX_ATTEMPTS_PER_TX = 3
+const TIMED_OUT = Symbol('timed out')
+const UNKNOWN_OUTCOME = 'outcome unknown, will re-check next tick'
 
 /** DBC MigrationProgress, stored in migration_progress (byte 308 of a pool account). */
 export const MIGRATION_PROGRESS = Object.freeze({
@@ -55,6 +66,12 @@ export const MIGRATION_PROGRESS = Object.freeze({
 export interface PoolMigrationState {
   readonly migrationProgress: number
   readonly isMigrated: boolean
+}
+
+/** The DBC pool and config a router market was opened for. */
+export interface MarketRef {
+  readonly pool: PublicKey
+  readonly config: PublicKey
 }
 
 /** The fields of a DBC transfer-hook pool this job reads. */
@@ -95,8 +112,8 @@ export interface MigrationPlan {
 
 /** Chain access of the job; tests replace any of them. Every fetch returns one result per address, in order. */
 export interface MigrateJobDeps {
-  /** The DBC pool of every router market. */
-  readonly listPools: (ctx: CrankContext) => Promise<readonly PublicKey[]>
+  /** Every router market's pool and config. */
+  readonly listMarkets: (ctx: CrankContext) => Promise<readonly MarketRef[]>
   readonly fetchPools: (ctx: CrankContext, pools: readonly PublicKey[]) => Promise<readonly LoadResult<PoolSnapshot>[]>
   readonly fetchConfigs: (ctx: CrankContext, configs: readonly PublicKey[]) => Promise<readonly LoadResult<ConfigSnapshot>[]>
   /** Builds the migration_damm_v2 transaction (DBC SDK migrateToDammV2). */
@@ -106,6 +123,33 @@ export interface MigrateJobDeps {
 const ok = <T>(value: T): LoadResult<T> => ({ ok: true, value })
 const fail = <T>(error: string): LoadResult<T> => ({ ok: false, error })
 const poolError = (pool: PublicKey, error: string): string => `${pool.toBase58()}: ${error}`
+
+/* ---------- timeouts ---------- */
+
+/**
+ * Settles with `promise`, or with TIMED_OUT after `ms`. The timer is always cleared. A later rejection of `promise`
+ * stays handled, because Promise.race keeps its subscription. (Mirrors finalize.ts.)
+ */
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  let timer: NodeJS.Timeout | undefined
+  const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), ms)
+  })
+  try {
+    return await Promise.race([promise, timeout])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** `promise`, or a rejection naming `what` once RPC_TIMEOUT_MS has passed. */
+async function bounded<T>(what: string, promise: Promise<T>): Promise<T> {
+  const result = await withTimeout(promise, RPC_TIMEOUT_MS)
+  if (result === TIMED_OUT) throw new Error(`${what} timed out after ${RPC_TIMEOUT_MS} ms`)
+  return result
+}
+
+/* ---------- planner ---------- */
 
 /** The curve is complete (LockedVesting) and nobody has migrated the pool yet. */
 export function needsMigration(pool: { migrationProgress: number; isMigrated: boolean }): boolean {
@@ -155,9 +199,9 @@ export function planMigrations(input: MigrationPlanInput): MigrationPlan {
 
 /* ---------- default chain access ---------- */
 
-async function listMarketPools(ctx: CrankContext): Promise<readonly PublicKey[]> {
-  const markets = await fetchAllMarkets(ctx.connection, ctx.cluster.routerProgramId)
-  return markets.map((market) => market.pool)
+async function listRouterMarkets(ctx: CrankContext): Promise<readonly MarketRef[]> {
+  const markets = await bounded('fetching router markets', fetchAllMarkets(ctx.connection, ctx.cluster.routerProgramId))
+  return markets.map((market) => Object.freeze({ pool: market.pool, config: market.config }))
 }
 
 async function fetchAccountInfos(
@@ -167,7 +211,7 @@ async function fetchAccountInfos(
   let infos: readonly (AccountInfo<Buffer> | null)[] = []
   for (let start = 0; start < addresses.length; start += MAX_ACCOUNTS_PER_REQUEST) {
     const batch = addresses.slice(start, start + MAX_ACCOUNTS_PER_REQUEST)
-    infos = [...infos, ...(await connection.getMultipleAccountsInfo(batch, COMMITMENT))]
+    infos = [...infos, ...(await bounded('getMultipleAccountsInfo', connection.getMultipleAccountsInfo(batch, COMMITMENT)))]
   }
   return infos
 }
@@ -227,25 +271,26 @@ async function buildDammV2Migration(ctx: CrankContext, target: MigrationTarget):
 }
 
 const DEFAULT_DEPS: MigrateJobDeps = Object.freeze({
-  listPools: listMarketPools,
+  listMarkets: listRouterMarkets,
   fetchPools: (ctx: CrankContext, pools: readonly PublicKey[]) => fetchDbcAccounts(ctx, pools, 'transferHookPool', toPoolSnapshot),
   fetchConfigs: (ctx: CrankContext, configs: readonly PublicKey[]) =>
     fetchDbcAccounts(ctx, configs, 'configWithTransferHook', toConfigSnapshot),
   buildMigration: buildDammV2Migration,
 })
 
-/* ---------- sending ---------- */
+/* ---------- preparing ---------- */
 
 type Outcome =
   | { readonly kind: 'sent'; readonly signature: string }
-  /** Someone else migrated the pool first. */
-  | { readonly kind: 'migrated-elsewhere'; readonly didSend: boolean }
+  /** The pool is migrated now (by someone else, or by our transaction whose confirmation timed out). */
+  | { readonly kind: 'migrated'; readonly didSend: boolean }
   | { readonly kind: 'failed'; readonly error: string; readonly didSend: boolean }
 
 type Confirmation = { readonly status: 'confirmed' } | { readonly status: 'failed'; readonly error: string } | { readonly status: 'timeout' }
 
-interface SignedMigration {
+interface PreparedMigration {
   readonly tx: VersionedTransaction
+  readonly wire: Uint8Array
   readonly blockhash: string
   readonly lastValidBlockHeight: number
 }
@@ -257,6 +302,9 @@ const targetFields = (target: MigrationTarget): Record<string, string> => ({
   dammPool: target.dammPool.toBase58(),
 })
 
+const tooLarge = (detail: string): string =>
+  `migration transaction is too large to send (${detail}; the limit is ${PACKET_DATA_SIZE} bytes)`
+
 /** The payer plus each position-NFT mint the migration instructions require as a signer (as migrate_devnet.ts). */
 function requiredSigners(migration: MigrateToDammV2Response, payer: Keypair): Keypair[] {
   const instructions = migration.transaction.instructions
@@ -266,45 +314,64 @@ function requiredSigners(migration: MigrateToDammV2Response, payer: Keypair): Ke
   return [payer, ...nftMints.filter((kp) => isSigner(kp.publicKey))]
 }
 
-/** A fresh legacy-message transaction from the SDK's instructions, signed with a current blockhash. */
-async function signMigration(ctx: CrankContext, migration: MigrateToDammV2Response): Promise<SignedMigration> {
-  const { blockhash, lastValidBlockHeight } = await ctx.connection.getLatestBlockhash(COMMITMENT)
-  const message = new TransactionMessage({
-    payerKey: ctx.payer.publicKey,
-    recentBlockhash: blockhash,
-    instructions: migration.transaction.instructions,
-  }).compileToLegacyMessage()
-  const tx = new VersionedTransaction(message)
-  tx.sign(requiredSigners(migration, ctx.payer))
-  return { tx, blockhash, lastValidBlockHeight }
+/**
+ * A fresh legacy-message transaction from the SDK's instructions, signed and serialized. An oversized message makes
+ * web3.js throw a RangeError while serializing; that, and a signed transaction over the packet size, get a clear error.
+ */
+function compileAndSign(payer: Keypair, migration: MigrateToDammV2Response, blockhash: string): Pick<PreparedMigration, 'tx' | 'wire'> {
+  let prepared: Pick<PreparedMigration, 'tx' | 'wire'>
+  try {
+    const message = new TransactionMessage({
+      payerKey: payer.publicKey,
+      recentBlockhash: blockhash,
+      instructions: migration.transaction.instructions,
+    }).compileToLegacyMessage()
+    const tx = new VersionedTransaction(message)
+    tx.sign(requiredSigners(migration, payer))
+    prepared = { tx, wire: tx.serialize() }
+  } catch (err) {
+    if (err instanceof RangeError) throw new Error(tooLarge(`serializing failed: ${err.message}`))
+    throw err
+  }
+  if (prepared.wire.length > PACKET_DATA_SIZE) throw new Error(tooLarge(`${prepared.wire.length} bytes`))
+  return prepared
 }
 
-/** Resolves (never rejects) with the confirmation, or `timeout` after CONFIRM_TIMEOUT_MS. */
-async function confirmWithTimeout(connection: Connection, signed: SignedMigration, signature: string): Promise<Confirmation> {
-  let timer: NodeJS.Timeout | undefined
-  const timeout = new Promise<Confirmation>((resolve) => {
-    timer = setTimeout(() => resolve({ status: 'timeout' }), CONFIRM_TIMEOUT_MS)
-  })
-  const strategy = { signature, blockhash: signed.blockhash, lastValidBlockHeight: signed.lastValidBlockHeight }
-  // Rejections become values so a late rejection after the timeout can never surface as an unhandled rejection.
-  const confirmation = connection.confirmTransaction(strategy, COMMITMENT).then(
-    (res): Confirmation =>
-      res.value.err === null
-        ? { status: 'confirmed' }
-        : { status: 'failed', error: `transaction ${signature} failed: ${JSON.stringify(res.value.err)}` },
-    (err: unknown): Confirmation => ({ status: 'failed', error: `confirming ${signature} failed: ${errorMessage(err)}` }),
-  )
+/** Builds the migration with the DBC SDK and signs it with a current blockhash. Sends nothing. */
+async function prepareMigration(
+  ctx: CrankContext,
+  deps: MigrateJobDeps,
+  target: MigrationTarget,
+): Promise<LoadResult<PreparedMigration>> {
   try {
-    return await Promise.race([confirmation, timeout])
-  } finally {
-    clearTimeout(timer)
+    const migration = await bounded('building the migration', deps.buildMigration(ctx, target))
+    const latest = await bounded('getLatestBlockhash', ctx.connection.getLatestBlockhash(COMMITMENT))
+    const signed = compileAndSign(ctx.payer, migration, latest.blockhash)
+    return ok({ ...signed, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight })
+  } catch (err) {
+    return fail(`preparing the migration failed: ${errorMessage(err)}`)
+  }
+}
+
+/* ---------- sending ---------- */
+
+/** Resolves (never rejects) with the confirmation, or `timeout` after CONFIRM_TIMEOUT_MS. */
+async function confirm(ctx: CrankContext, prepared: PreparedMigration, signature: string): Promise<Confirmation> {
+  const strategy = { signature, blockhash: prepared.blockhash, lastValidBlockHeight: prepared.lastValidBlockHeight }
+  try {
+    const result = await withTimeout(ctx.connection.confirmTransaction(strategy, COMMITMENT), CONFIRM_TIMEOUT_MS)
+    if (result === TIMED_OUT) return { status: 'timeout' }
+    if (result.value.err === null) return { status: 'confirmed' }
+    return { status: 'failed', error: redactUrls(`transaction ${signature} failed: ${JSON.stringify(result.value.err)}`) }
+  } catch (err) {
+    return { status: 'failed', error: redactUrls(`confirming ${signature} failed: ${errorMessage(err)}`) }
   }
 }
 
 /** Re-reads the pool after a failure: ok(true) when it is migrated now. */
 async function isMigratedNow(ctx: CrankContext, deps: MigrateJobDeps, pool: PublicKey): Promise<LoadResult<boolean>> {
   try {
-    const [result] = await deps.fetchPools(ctx, [pool])
+    const [result] = await bounded('re-reading the pool', deps.fetchPools(ctx, [pool]))
     if (result === undefined) return fail('re-reading the pool returned nothing')
     return result.ok ? ok(isMigrated(result.value.state)) : fail(result.error)
   } catch (err) {
@@ -319,16 +386,19 @@ async function settleFailure(
   target: MigrationTarget,
   failure: { readonly error: string; readonly didSend: boolean; readonly logs?: readonly string[] },
 ): Promise<Outcome> {
+  const error = redactUrls(failure.error)
   const now = await isMigratedNow(ctx, deps, target.pool)
   if (now.ok && now.value) {
-    ctx.log.info('pool already migrated by someone else', { ...targetFields(target), attempt: failure.error })
-    return { kind: 'migrated-elsewhere', didSend: failure.didSend }
+    ctx.log.info('pool already migrated by someone else', { ...targetFields(target), attempt: error })
+    return { kind: 'migrated', didSend: failure.didSend }
   }
-  const recheck = now.ok ? 'pool still not migrated' : now.error
-  ctx.log.error('pool migration failed', { ...targetFields(target), error: failure.error, recheck, logs: failure.logs ?? [] })
-  return { kind: 'failed', error: failure.error, didSend: failure.didSend }
+  const recheck = now.ok ? 'pool still not migrated' : redactUrls(now.error)
+  const logs = (failure.logs ?? []).map(redactUrls)
+  ctx.log.error('pool migration failed', { ...targetFields(target), error, recheck, logs })
+  return { kind: 'failed', error, didSend: failure.didSend }
 }
 
+/** Never resent in this tick: the pool counts as migrated if the re-read says so, else the outcome is unknown. */
 async function onConfirmTimeout(
   ctx: CrankContext,
   deps: MigrateJobDeps,
@@ -337,25 +407,29 @@ async function onConfirmTimeout(
 ): Promise<Outcome> {
   const now = await isMigratedNow(ctx, deps, target.pool)
   if (now.ok && now.value) {
-    ctx.log.info('migrated pool to DAMM v2 (confirmed by pool state after timeout)', { ...targetFields(target), signature })
-  } else {
-    ctx.log.warn('migration outcome unknown: confirmation timed out; the next tick re-reads the pool', {
-      ...targetFields(target),
-      signature,
-      timeoutMs: CONFIRM_TIMEOUT_MS,
-    })
+    ctx.log.info('pool is migrated (confirmation timed out, pool state shows it migrated)', { ...targetFields(target), signature })
+    return { kind: 'migrated', didSend: true }
   }
-  return { kind: 'sent', signature }
+  const error = `transaction ${signature} not confirmed within ${CONFIRM_TIMEOUT_MS} ms; ${UNKNOWN_OUTCOME}`
+  ctx.log.warn(`migration ${UNKNOWN_OUTCOME}`, { ...targetFields(target), signature, timeoutMs: CONFIRM_TIMEOUT_MS })
+  return { kind: 'failed', error, didSend: true }
 }
 
 async function sendAndConfirm(
   ctx: CrankContext,
   deps: MigrateJobDeps,
   target: MigrationTarget,
-  signed: SignedMigration,
+  prepared: PreparedMigration,
 ): Promise<Outcome> {
-  const signature = await ctx.connection.sendRawTransaction(signed.tx.serialize(), { skipPreflight: true })
-  const confirmation = await confirmWithTimeout(ctx.connection, signed, signature)
+  let signature: string
+  try {
+    // Preflight would repeat the simulation that just passed.
+    signature = await bounded('sendRawTransaction', ctx.connection.sendRawTransaction(prepared.wire, { skipPreflight: true }))
+  } catch (err) {
+    // The transaction may still reach a leader, so this counts as a send and is never retried this tick.
+    return settleFailure(ctx, deps, target, { error: `sending the migration failed: ${errorMessage(err)}`, didSend: true })
+  }
+  const confirmation = await confirm(ctx, prepared, signature)
   if (confirmation.status === 'timeout') return onConfirmTimeout(ctx, deps, target, signature)
   if (confirmation.status === 'failed') return settleFailure(ctx, deps, target, { error: confirmation.error, didSend: true })
   ctx.log.info('migrated pool to DAMM v2', { ...targetFields(target), signature })
@@ -364,26 +438,27 @@ async function sendAndConfirm(
 
 /** Builds, simulates and (only if the simulation passes) sends one pool's migration. Never throws. */
 async function migratePool(ctx: CrankContext, deps: MigrateJobDeps, target: MigrationTarget): Promise<Outcome> {
-  let migration: MigrateToDammV2Response
-  try {
-    migration = await deps.buildMigration(ctx, target)
-  } catch (err) {
-    const error = `building the migration failed: ${errorMessage(err)}`
+  const prepared = await prepareMigration(ctx, deps, target)
+  if (!prepared.ok) {
+    const error = redactUrls(prepared.error)
     ctx.log.error('pool migration failed', { ...targetFields(target), error })
     return { kind: 'failed', error, didSend: false }
   }
+  let simulation: Awaited<ReturnType<Connection['simulateTransaction']>>
   try {
-    const signed = await signMigration(ctx, migration)
-    const simulation = await ctx.connection.simulateTransaction(signed.tx, { commitment: COMMITMENT, sigVerify: false })
-    if (simulation.value.err !== null) {
-      const error = `simulation failed: ${JSON.stringify(simulation.value.err)}`
-      const logs = (simulation.value.logs ?? []).slice(-LOG_TAIL_LINES)
-      return await settleFailure(ctx, deps, target, { error, didSend: false, logs })
-    }
-    return await sendAndConfirm(ctx, deps, target, signed)
+    simulation = await bounded(
+      'simulateTransaction',
+      ctx.connection.simulateTransaction(prepared.value.tx, { commitment: COMMITMENT, sigVerify: false }),
+    )
   } catch (err) {
-    return settleFailure(ctx, deps, target, { error: `sending the migration failed: ${errorMessage(err)}`, didSend: false })
+    return settleFailure(ctx, deps, target, { error: `simulating the migration failed: ${errorMessage(err)}`, didSend: false })
   }
+  if (simulation.value.err !== null) {
+    const error = `simulation failed: ${JSON.stringify(simulation.value.err)}`
+    const logs = (simulation.value.logs ?? []).slice(-LOG_TAIL_LINES)
+    return settleFailure(ctx, deps, target, { error, didSend: false, logs })
+  }
+  return sendAndConfirm(ctx, deps, target, prepared.value)
 }
 
 interface Tally {
@@ -397,28 +472,78 @@ function addOutcome(tally: Tally, target: MigrationTarget, outcome: Outcome): Ta
   switch (outcome.kind) {
     case 'sent':
       return { ...tally, sent: [...tally.sent, outcome.signature], sends: tally.sends + 1 }
-    case 'migrated-elsewhere':
+    case 'migrated':
       return { ...tally, sends: tally.sends + Number(outcome.didSend), skipped: tally.skipped + 1 }
     case 'failed':
       return { ...tally, sends: tally.sends + Number(outcome.didSend), errors: [...tally.errors, poolError(target.pool, outcome.error)] }
   }
 }
 
-/** Migrates targets in order while the tick's tx budget lasts; the rest are skipped until the next tick. */
+/**
+ * Migrates targets in order while the tick lasts: at most ctx.maxTx sends and ctx.maxTx * MAX_ATTEMPTS_PER_TX attempts
+ * (a failed build or simulation is an attempt too). The rest are skipped until the next tick.
+ */
 async function executePlan(ctx: CrankContext, deps: MigrateJobDeps, targets: readonly MigrationTarget[]): Promise<Tally> {
+  const maxAttempts = ctx.maxTx * MAX_ATTEMPTS_PER_TX
   let tally: Tally = { sent: [], sends: 0, skipped: 0, errors: [] }
+  let attempts = 0
   let deferred = 0
   for (const target of targets) {
-    if (tally.sends >= ctx.maxTx) deferred += 1
-    else tally = addOutcome(tally, target, await migratePool(ctx, deps, target))
+    if (tally.sends >= ctx.maxTx || attempts >= maxAttempts) {
+      deferred += 1
+      continue
+    }
+    attempts += 1
+    tally = addOutcome(tally, target, await migratePool(ctx, deps, target))
   }
   if (deferred > 0) {
-    ctx.log.info('tx budget used up; remaining pools wait for the next tick', { job: JOB_NAME, maxTx: ctx.maxTx, deferred })
+    ctx.log.info('tick budget used up; remaining pools wait for the next tick', {
+      job: JOB_NAME,
+      maxTx: ctx.maxTx,
+      maxAttempts,
+      deferred,
+    })
   }
   return { ...tally, skipped: tally.skipped + deferred }
 }
 
 /* ---------- job ---------- */
+
+interface LoadedPools {
+  readonly pools: readonly PoolSnapshot[]
+  readonly errors: readonly string[]
+  /** Pools whose DBC config is not the one their router market was opened for. */
+  readonly mismatched: number
+}
+
+type PoolCheck =
+  | { readonly kind: 'ok'; readonly pool: PoolSnapshot }
+  | { readonly kind: 'error'; readonly error: string }
+  | { readonly kind: 'mismatch' }
+
+function checkPool(ctx: CrankContext, market: MarketRef, result: LoadResult<PoolSnapshot>): PoolCheck {
+  if (!result.ok) return { kind: 'error', error: poolError(market.pool, result.error) }
+  if (result.value.config.equals(market.config)) return { kind: 'ok', pool: result.value }
+  ctx.log.warn('pool config does not match its router market; pool skipped', {
+    job: JOB_NAME,
+    pool: market.pool.toBase58(),
+    poolConfig: result.value.config.toBase58(),
+    marketConfig: market.config.toBase58(),
+  })
+  return { kind: 'mismatch' }
+}
+
+/** Each market's pool, kept only when its own config matches the market's config (else skipped with a warning). */
+async function loadPools(ctx: CrankContext, deps: MigrateJobDeps): Promise<LoadedPools> {
+  const markets = await deps.listMarkets(ctx)
+  const loaded = markets.length === 0 ? [] : await deps.fetchPools(ctx, markets.map((market) => market.pool))
+  const checks = markets.map((market, i) => checkPool(ctx, market, loaded[i] ?? fail<PoolSnapshot>('pool was not returned')))
+  return {
+    pools: checks.flatMap((check) => (check.kind === 'ok' ? [check.pool] : [])),
+    errors: checks.flatMap((check) => (check.kind === 'error' ? [check.error] : [])),
+    mismatched: checks.filter((check) => check.kind === 'mismatch').length,
+  }
+}
 
 async function loadConfigs(
   ctx: CrankContext,
@@ -432,19 +557,14 @@ async function loadConfigs(
 }
 
 async function runMigrations(ctx: CrankContext, deps: MigrateJobDeps): Promise<CrankJobResult> {
-  const addresses = await deps.listPools(ctx)
-  const loaded = addresses.length === 0 ? [] : await deps.fetchPools(ctx, addresses)
-  const results = addresses.map((address, i) => ({ address, result: loaded[i] ?? fail<PoolSnapshot>('pool was not returned') }))
-  const pools = results.flatMap(({ result }) => (result.ok ? [result.value] : []))
-  const loadErrors = results.flatMap(({ address, result }) => (result.ok ? [] : [poolError(address, result.error)]))
-
-  const configs = await loadConfigs(ctx, deps, pools.filter((pool) => needsMigration(pool.state)))
-  const plan = planMigrations({ pools, configs })
+  const loaded = await loadPools(ctx, deps)
+  const configs = await loadConfigs(ctx, deps, loaded.pools.filter((pool) => needsMigration(pool.state)))
+  const plan = planMigrations({ pools: loaded.pools, configs })
   const tally = await executePlan(ctx, deps, plan.targets)
   return {
     sent: [...tally.sent],
-    skipped: tally.skipped,
-    errors: [...loadErrors, ...plan.errors, ...tally.errors].map(redactUrls),
+    skipped: tally.skipped + loaded.mismatched,
+    errors: [...loaded.errors, ...plan.errors, ...tally.errors].map(redactUrls),
   }
 }
 
@@ -457,7 +577,9 @@ export function createMigrateJob(overrides: Partial<MigrateJobDeps> = {}): Crank
       try {
         return await runMigrations(ctx, deps)
       } catch (err) {
-        return { sent: [], skipped: 0, errors: [redactUrls(`migrate: ${errorMessage(err)}`)] }
+        const error = redactUrls(`migrate: ${errorMessage(err)}`)
+        ctx.log.error('migrate job failed', { job: JOB_NAME, error })
+        return { sent: [], skipped: 0, errors: [error] }
       }
     },
   })
