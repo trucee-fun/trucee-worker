@@ -917,6 +917,22 @@ describe('autoExitJob ATA rent and payer guards (CRK-10)', () => {
     expect(ran.sent).toEqual(['sig-1'])
   })
 
+  it('counts an off-curve owner as skipped every tick and warns once per position for the job instance', async () => {
+    const market = makeMarket()
+    const position = makePosition(market, { owner: findMarketPda(randomKey()), autoExitDeadline: CHAIN_NOW - 5n })
+    const chain = fakeConnection(chainOf([{ market, position }]))
+    const log = fakeLog()
+    const job = createAutoExitJob(guards())
+
+    const first = await job.run(context(chain.connection, Keypair.generate(), 10, log))
+    const second = await job.run(context(chain.connection, Keypair.generate(), 10, log))
+
+    expect([first, second]).toEqual([{ sent: [], skipped: 1, errors: [] }, { sent: [], skipped: 1, errors: [] }])
+    expect(log.warn).toHaveBeenCalledTimes(1)
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('off curve'), expect.objectContaining({ position: position.address.toBase58() }))
+    expect(chain.fake.simulateTransaction).not.toHaveBeenCalled()
+  })
+
   it('exits a real overdue position this tick even behind 50 dust positions with earlier deadlines', async () => {
     const dust = Array.from({ length: 50 }, (_, i) => dustEntry(CHAIN_NOW - 1_000n + BigInt(i)))
     const real = dueEntry(CHAIN_NOW - 5n)

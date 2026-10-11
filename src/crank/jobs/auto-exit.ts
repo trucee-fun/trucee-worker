@@ -43,6 +43,7 @@ import {
 import { defaultCrankGuards, type CrankGuards } from '../../config.js'
 import { errorMessage, redactUrls } from '../../log.js'
 import type { CrankContext, CrankJob, CrankJobResult } from '../index.js'
+import { MAX_REPORTED_OFF_CURVE, createBoundedKeySet, type BoundedKeySet } from './claims.js'
 
 const JOB_NAME = 'auto-exit'
 const COMMITMENT = 'confirmed'
@@ -112,6 +113,8 @@ interface ExitPlan {
   readonly exits: readonly PlannedExit[]
   /** Due exits skipped because the owner's quote ATA is missing and the refund is below minAtaValueLamports. */
   readonly belowMinValue: number
+  /** Due positions on a live curve skipped because the owner is off the ed25519 curve (it has no canonical ATA). */
+  readonly offCurve: readonly PositionAccount[]
 }
 
 /** A due position on a live curve, with what its exit needs. */
@@ -144,23 +147,29 @@ function byDeadline(a: PositionAccount, b: PositionAccount): number {
   return order !== 0 ? order : compare(a.address.toBase58(), b.address.toBase58())
 }
 
+const OFF_CURVE = Symbol('owner off curve')
+type TargetCheck = ExitTarget | typeof OFF_CURVE | null
+
 /**
- * Null unless the market is known and not finalized, its curve is known to be live, its quote mint is allowed, and the
- * owner is on the ed25519 curve (an off-curve owner has no canonical ATA).
+ * Null unless the market is known and not finalized, its curve is known to be live and its quote mint is allowed;
+ * OFF_CURVE when, beyond that, the owner is off the ed25519 curve (it has no canonical ATA).
  */
 function exitTarget(
   position: PositionAccount,
   markets: ReadonlyMap<string, MarketAccount>,
   poolProgress: ReadonlyMap<string, number>,
-): ExitTarget | null {
+): TargetCheck {
   const market = markets.get(position.market.toBase58())
   if (market === undefined || market.finalized) return null
   if (poolProgress.get(market.pool.toBase58()) !== CURVE_LIVE) return null
   const quoteTokenProgram = QUOTE_TOKEN_PROGRAMS.get(market.quoteMint.toBase58())
-  if (quoteTokenProgram === undefined || !PublicKey.isOnCurve(position.owner.toBytes())) return null
+  if (quoteTokenProgram === undefined) return null
+  if (!PublicKey.isOnCurve(position.owner.toBytes())) return OFF_CURVE
   const ownerQuote = getAssociatedTokenAddressSync(market.quoteMint, position.owner, false, quoteTokenProgram)
   return { position, market, quoteTokenProgram, ownerQuote }
 }
+
+const isTarget = (check: TargetCheck): check is ExitTarget => check !== null && check !== OFF_CURVE
 
 const BELOW_MIN_VALUE = Symbol('below min value')
 
@@ -184,15 +193,18 @@ function planExits(
   payer: PublicKey,
   ata: AtaRule,
 ): ExitPlan {
-  const planned = positions
+  const checked = positions
     .filter((position) => isDue(position, nowUnix))
     .sort(byDeadline)
-    .map((position) => exitTarget(position, markets, poolProgress))
-    .filter((target): target is ExitTarget => target !== null)
-    .map((target) => planTarget(target, ata, payer))
+    .map((position): { readonly position: PositionAccount; readonly check: TargetCheck } => ({
+      position,
+      check: exitTarget(position, markets, poolProgress),
+    }))
+  const planned = checked.flatMap(({ check }) => (isTarget(check) ? [planTarget(check, ata, payer)] : []))
   return {
     exits: planned.filter((exit): exit is PlannedExit => exit !== BELOW_MIN_VALUE),
     belowMinValue: planned.filter((exit) => exit === BELOW_MIN_VALUE).length,
+    offCurve: checked.flatMap(({ position, check }) => (check === OFF_CURVE ? [position] : [])),
   }
 }
 
@@ -574,7 +586,23 @@ function logAtaSkips(ctx: CrankContext, guards: AutoExitGuards, belowMinValue: n
   })
 }
 
-async function runAutoExits(ctx: CrankContext, configured: AutoExitGuards | undefined): Promise<CrankJobResult> {
+/** Off-curve positions are skipped (and counted) every tick, but each is warned about once per job instance. */
+function reportOffCurve(ctx: CrankContext, reported: BoundedKeySet, positions: readonly PositionAccount[]): void {
+  for (const position of positions) {
+    const address = position.address.toBase58()
+    if (reported.has(address)) continue
+    reported.add(address)
+    ctx.log.warn('auto-exit: owner is off curve; skipped', {
+      job: JOB_NAME, market: position.market.toBase58(), position: address, owner: position.owner.toBase58(),
+    })
+  }
+}
+
+async function runAutoExits(
+  ctx: CrankContext,
+  configured: AutoExitGuards | undefined,
+  reportedOffCurve: BoundedKeySet,
+): Promise<CrankJobResult> {
   if (ctx.maxTx <= 0) return emptyResult()
   const cluster = ctx.cluster
   requirePlanPrograms(cluster)
@@ -584,16 +612,17 @@ async function runAutoExits(ctx: CrankContext, configured: AutoExitGuards | unde
   const due = positions.value.filter((position) => isDue(position, nowUnix))
   const markets = await fetchMarkets(ctx, cluster.routerProgramId, due)
   const poolProgress = await fetchPoolProgress(ctx, cluster.dbcProgramId, markets.value.values())
-  const targets = due.flatMap((position) => exitTarget(position, markets.value, poolProgress.value) ?? [])
+  const targets = due.map((position) => exitTarget(position, markets.value, poolProgress.value)).filter(isTarget)
   const ownerQuoteAtaExists = await fetchAtaExistence(ctx, targets)
   const ata: AtaRule = { ownerQuoteAtaExists, minAtaValueLamports: guards.minAtaValueLamports }
   const plan = planExits(due, markets.value, poolProgress.value, nowUnix, ctx.payer.publicKey, ata)
   const executed = await executeExits(ctx, plan.exits, guards.maxAtaCreatesPerTick)
   logAtaSkips(ctx, guards, plan.belowMinValue, executed.overCreateCap)
+  reportOffCurve(ctx, reportedOffCurve, plan.offCurve)
   const { result } = executed
   return {
     ...result,
-    skipped: result.skipped + plan.belowMinValue,
+    skipped: result.skipped + plan.belowMinValue + plan.offCurve.length,
     errors: [...positions.errors, ...markets.errors, ...poolProgress.errors, ...result.errors],
   }
 }
@@ -608,11 +637,12 @@ function redactErrors(result: CrankJobResult): CrankJobResult {
  * Without `guards` it uses defaultCrankGuards for ctx.cluster; the worker passes its WorkerConfig. Never throws.
  */
 export function createAutoExitJob(guards?: AutoExitGuards): CrankJob {
+  const reportedOffCurve = createBoundedKeySet(MAX_REPORTED_OFF_CURVE)
   return Object.freeze({
     name: JOB_NAME,
     async run(ctx: CrankContext): Promise<CrankJobResult> {
       try {
-        return redactErrors(await runAutoExits(ctx, guards))
+        return redactErrors(await runAutoExits(ctx, guards, reportedOffCurve))
       } catch (err) {
         return redactErrors({ sent: [], skipped: 0, errors: [`${JOB_NAME}: ${errorMessage(err)}`] })
       }

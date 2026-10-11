@@ -42,6 +42,7 @@ import {
   CONFIRM_TIMEOUT_MS,
   RPC_TIMEOUT_MS,
   claimsJob as defaultClaimsJob,
+  createBoundedKeySet,
   createClaimsJob,
   planClaims,
 } from '../src/crank/jobs/claims.js'
@@ -819,6 +820,17 @@ describe('claimsJob', () => {
     expect(log.warn).toHaveBeenCalledTimes(1)
   })
 
+  it('keeps the off-curve memory per job instance, not per module', async () => {
+    const market = makeMarket()
+    const fake = fakeConnection({ markets: [market], positions: [makePosition(market, offCurveOwner())] })
+    const log = silentLog()
+
+    await createClaimsJob(OPEN_GUARDS).run(makeContext(fake, 10, log))
+    await createClaimsJob(OPEN_GUARDS).run(makeContext(fake, 10, log))
+
+    expect(log.warn).toHaveBeenCalledTimes(2)
+  })
+
   it('records an error without the RPC URL or its key, instead of throwing, when the market read fails', async () => {
     const fake = fakeConnection({ markets: [] })
     fake.getProgramAccounts.mockRejectedValueOnce(new Error(`request to ${RPC_URL_WITH_KEY} failed`))
@@ -926,5 +938,19 @@ describe('claimsJob ATA rent and payer guards (CRK-10)', () => {
     expect(below!.getProgramAccounts).not.toHaveBeenCalled()
     expect([log.info, log.warn, log.error].map((fn) => fn.mock.calls.length)).toEqual([0, 1, 0])
     expect(ran.sent).toEqual(['sig-1'])
+  })
+})
+
+describe('createBoundedKeySet', () => {
+  it('remembers at most its capacity, forgetting the oldest key first', () => {
+    const keys = createBoundedKeySet(2)
+
+    keys.add('a')
+    keys.add('b')
+    keys.add('a') // already known: no eviction, no reorder
+    keys.add('c')
+
+    expect(['a', 'b', 'c'].map((key) => keys.has(key))).toEqual([false, true, true])
+    expect(keys.size()).toBe(2)
   })
 })

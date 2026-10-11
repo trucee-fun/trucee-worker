@@ -150,11 +150,17 @@ describe('loadConfig', () => {
     'throws when %s is not a non-negative integer',
     (key) => {
       const base = { CLUSTER: 'devnet', RPC_URL: SECRET_RPC_URL }
-      for (const bad of ['-1', '2.5', 'lots', '9007199254740993']) {
+      for (const bad of [' ', '0x10', '1e3', '-1', '+1', '2.5', 'lots', '9007199254740993']) {
         expect(() => loadConfig({ ...base, [key]: bad })).toThrow(new RegExp(`${key} must be a non-negative integer`))
       }
     },
   )
+
+  it('trims surrounding whitespace from the guard values', () => {
+    const cfg = loadConfig({ CLUSTER: 'devnet', RPC_URL: SECRET_RPC_URL, MIN_ATA_VALUE_LAMPORTS: ' 7 ', MAX_ATA_CREATES_PER_TICK: '\t3\n' })
+
+    expect([cfg.minAtaValueLamports, cfg.maxAtaCreatesPerTick]).toEqual([7n, 3])
+  })
 
   it('never puts the RPC_URL value in the thrown error', () => {
     const badEnvs: NodeJS.ProcessEnv[] = [

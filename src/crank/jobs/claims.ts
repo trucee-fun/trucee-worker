@@ -252,20 +252,50 @@ function quoteTokenProgramOf(cluster: ClusterConfig, market: MarketAccount): Pub
 
 const isOnCurve = (owner: PublicKey): boolean => PublicKey.isOnCurve(owner.toBytes())
 
-/**
- * Off-curve positions already warned about. They are skipped (and counted) every tick, but a warning every tick
- * would only repeat itself, so each is logged once per process.
- */
-let reportedOffCurve: ReadonlySet<string> = new Set()
+/** Off-curve positions a job remembers having warned about; past this, the oldest may be warned about again. */
+export const MAX_REPORTED_OFF_CURVE = 10_000
 
-function reportOffCurve(ctx: CrankContext, market: MarketAccount, positions: readonly PositionAccount[]): void {
-  const fresh = positions.filter((position) => !reportedOffCurve.has(position.address.toBase58()))
-  fresh.forEach((position) =>
+/** A set of string keys with a fixed capacity. */
+export interface BoundedKeySet {
+  has(key: string): boolean
+  /** Remembers `key`; past the capacity the oldest key is forgotten. A known key keeps its place. */
+  add(key: string): void
+  size(): number
+}
+
+/**
+ * A set of at most `capacity` keys that forgets the oldest first (a Set iterates in insertion order). It mutates in
+ * place, so each owner (a job instance) keeps its own.
+ */
+export function createBoundedKeySet(capacity: number): BoundedKeySet {
+  if (!Number.isSafeInteger(capacity) || capacity < 1) throw new RangeError(`capacity must be a positive integer, got ${capacity}`)
+  const keys = new Set<string>()
+  return Object.freeze({
+    has: (key: string): boolean => keys.has(key),
+    add(key: string): void {
+      if (keys.has(key)) return
+      keys.add(key)
+      if (keys.size <= capacity) return
+      const oldest = keys.values().next()
+      if (oldest.done !== true) keys.delete(oldest.value)
+    },
+    size: (): number => keys.size,
+  })
+}
+
+/**
+ * Off-curve positions are skipped (and counted) every tick, but a warning every tick would only repeat itself, so
+ * each is logged once per job instance.
+ */
+function reportOffCurve(ctx: CrankContext, reported: BoundedKeySet, positions: readonly PositionAccount[]): void {
+  for (const position of positions) {
+    const address = position.address.toBase58()
+    if (reported.has(address)) continue
+    reported.add(address)
     ctx.log.warn('claims: owner is off curve; skipped', {
-      market: market.address.toBase58(), position: position.address.toBase58(), owner: position.owner.toBase58(),
-    }),
-  )
-  reportedOffCurve = new Set([...reportedOffCurve, ...fresh.map((position) => position.address.toBase58())])
+      market: position.market.toBase58(), position: address, owner: position.owner.toBase58(),
+    })
+  }
 }
 
 /* ---------- per-market plan ---------- */
@@ -283,6 +313,8 @@ interface MarketPlan {
   readonly skipped: number
   /** Claims skipped because the owner's quote ATA is missing and the share is below minAtaValueLamports. */
   readonly belowMinValue: number
+  /** Positions skipped because the owner is off the ed25519 curve (no canonical ATA); counted in `skipped`. */
+  readonly offCurve: readonly PositionAccount[]
   readonly errors: readonly string[]
 }
 
@@ -299,7 +331,6 @@ async function readAndPlanMarket(
   const fetched = await fetchMarketPositions(ctx.connection, cluster.routerProgramId, market)
   const claimable = fetched.positions.filter((position) => isOnCurve(position.owner))
   const offCurve = fetched.positions.filter((position) => !isOnCurve(position.owner))
-  reportOffCurve(ctx, market, offCurve)
   const accounts = marketAccountsFor(market, quoteTokenProgram)
   const atas = claimable.map((position) => ownerQuoteAta(accounts, position.owner))
   const ataExists = await fetchAtaExistence(ctx.connection, atas, quoteTokenProgram)
@@ -312,7 +343,7 @@ async function readAndPlanMarket(
     .filter((claim) => claim.instructions.length > 0)
     .map((claim) => ({ ...claim, createsAta: includesAtaCreate(claim.instructions) }))
   const belowMinValue = claimable.length - claims.length
-  return { claims, skipped: offCurve.length + belowMinValue, belowMinValue, errors: fetched.errors }
+  return { claims, skipped: offCurve.length + belowMinValue, belowMinValue, offCurve, errors: fetched.errors }
 }
 
 /** Reads and plans one finalized market. Never throws: a failure becomes the market's only error. */
@@ -325,7 +356,8 @@ async function planMarket(
   try {
     return await readAndPlanMarket(ctx, cluster, market, minAtaValueLamports)
   } catch (err) {
-    return { claims: [], skipped: 0, belowMinValue: 0, errors: [`market ${market.address.toBase58()}: ${errorMessage(err)}`] }
+    const errors = [`market ${market.address.toBase58()}: ${errorMessage(err)}`]
+    return { claims: [], skipped: 0, belowMinValue: 0, offCurve: [], errors }
   }
 }
 
@@ -479,6 +511,7 @@ async function planTick(ctx: CrankContext, cluster: ClusterConfig, guards: Claim
   let claims: readonly PlannedClaim[] = []
   let skipped = 0
   let belowMinValue = 0
+  let offCurve: readonly PositionAccount[] = []
   let errors: readonly string[] = []
   for (const market of markets.filter((candidate) => candidate.finalized)) {
     if (attemptable(claims, guards.maxAtaCreatesPerTick) >= maxAttempts(ctx.maxTx)) break
@@ -486,9 +519,10 @@ async function planTick(ctx: CrankContext, cluster: ClusterConfig, guards: Claim
     claims = [...claims, ...plan.claims]
     skipped += plan.skipped
     belowMinValue += plan.belowMinValue
+    offCurve = [...offCurve, ...plan.offCurve]
     errors = [...errors, ...plan.errors]
   }
-  return { claims, skipped, belowMinValue, errors }
+  return { claims, skipped, belowMinValue, offCurve, errors }
 }
 
 /** sent, unknown, or failed after the transaction went out: an ATA it creates may exist now. */
@@ -541,12 +575,17 @@ function logAtaSkips(ctx: CrankContext, guards: ClaimsGuards, belowMinValue: num
   })
 }
 
-async function runClaims(ctx: CrankContext, configured: ClaimsGuards | undefined): Promise<CrankJobResult> {
+async function runClaims(
+  ctx: CrankContext,
+  configured: ClaimsGuards | undefined,
+  reportedOffCurve: BoundedKeySet,
+): Promise<CrankJobResult> {
   if (ctx.maxTx <= 0) return toResult(EMPTY_TALLY)
   const cluster = ctx.cluster
   const guards = configured ?? defaultCrankGuards(cluster.cluster)
   if (!(await payerAboveFloor(ctx, guards.crankMinSolLamports))) return toResult(EMPTY_TALLY)
   const plan = await planTick(ctx, cluster, guards)
+  reportOffCurve(ctx, reportedOffCurve, plan.offCurve)
   const planned = withErrors(withSkipped(EMPTY_TALLY, plan.skipped), plan.errors)
   const sent = plan.claims.length === 0 ? planned : await sendClaims(ctx, plan.claims, planned, guards.maxAtaCreatesPerTick)
   logAtaSkips(ctx, guards, plan.belowMinValue, sent.overCreateCap)
@@ -558,11 +597,12 @@ async function runClaims(ctx: CrankContext, configured: ClaimsGuards | undefined
  * WorkerConfig. Never throws.
  */
 export function createClaimsJob(guards?: ClaimsGuards): CrankJob {
+  const reportedOffCurve = createBoundedKeySet(MAX_REPORTED_OFF_CURVE)
   return Object.freeze({
     name: JOB_NAME,
     async run(ctx: CrankContext): Promise<CrankJobResult> {
       try {
-        return await runClaims(ctx, guards)
+        return await runClaims(ctx, guards, reportedOffCurve)
       } catch (err) {
         return toResult(withError(EMPTY_TALLY, `claims: ${errorMessage(err)}`))
       }

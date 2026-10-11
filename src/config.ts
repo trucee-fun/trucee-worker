@@ -65,10 +65,18 @@ const ENV_KEYS = [
 ] as const
 
 const NON_NEGATIVE_INTEGER = 'must be a non-negative integer'
+/** Plain decimal digits only: Number() would also read " " as 0, "0x10" as 16 and "1e3" as 1000. */
+const DECIMAL_DIGITS = /^\d+$/
 
-/** A non-negative safe integer; unset means the cluster default, applied by loadConfig. */
+/** A non-negative safe integer written in decimal digits (surrounding whitespace trimmed); unset means the default. */
 const nonNegativeInteger = () =>
-  z.coerce.number({ error: NON_NEGATIVE_INTEGER }).int(NON_NEGATIVE_INTEGER).min(0, NON_NEGATIVE_INTEGER).optional()
+  z
+    .string({ error: NON_NEGATIVE_INTEGER })
+    .trim()
+    .regex(DECIMAL_DIGITS, NON_NEGATIVE_INTEGER)
+    .transform(Number)
+    .refine(Number.isSafeInteger, NON_NEGATIVE_INTEGER)
+    .optional()
 
 const envSchema = z.object({
   CLUSTER: z.enum(CLUSTERS, {
