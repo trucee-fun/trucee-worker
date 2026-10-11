@@ -1,0 +1,3 @@
+# Throwaway trader keys and run logs of devnet scripts (seed-devnet.ts, crank runs): never commit
+out/*.traders.json
+out/*.log

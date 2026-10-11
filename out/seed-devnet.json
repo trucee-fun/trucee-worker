@@ -1,0 +1,761 @@
+{
+ "task": "OPS-07",
+ "cluster": "devnet",
+ "routerProgramId": "D4sk6wwELD6cmd7tv6hE4hkxQP8SF8tjdegYym8iWNNb",
+ "hookProgramId": "CUNNV1MqVB53N4jWn91uVFXm1dBSyaynR6iBCbufJWMS",
+ "dbcProgramId": "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN",
+ "payer": "CamCkeR9iqBij1ZyrEYj9mp6emQtpMVdWWVCUX46tFLE",
+ "metadataBaseUrl": "http://localhost:3000",
+ "migrationQuoteThreshold": "300000000",
+ "feeBps": 100,
+ "traders": [
+  "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+  "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+  "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+  "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+  "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+  "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb"
+ ],
+ "payerSolBefore": "13.799391009",
+ "complete": true,
+ "generatedAt": "2026-10-11T12:57:34.889Z",
+ "payerSolAfter": "13.008821394",
+ "spentSol": "0.790569615",
+ "markets": [
+  {
+   "label": "live",
+   "name": "Trucee Demo Live",
+   "symbol": "DEMO1",
+   "uri": "http://localhost:3000/api/metadata/b8daaf089a8788a1",
+   "image": "http://localhost:3000/api/images/b8daaf089a8788a1.png",
+   "market": "DCeyiGCXNU7dTsPGAnupMHYHH9ysLHXKiLZrwpnHo1EJ",
+   "pool": "2Gsy2RWYUp3nMGmjSwwBy3sb1uRSgYnQTK1bFfEbyXB4",
+   "config": "HXSRwmyXKnK5bpNYW4rfZghkmmdb3jYG4LFSyQQNKWj2",
+   "baseMint": "9FvfUbTQDN9LXqz3JNH1zHaNVsxkDetp4RwaKr7x4mPx",
+   "quoteMint": "So11111111111111111111111111111111111111112",
+   "bufferVault": "9XNLZG8XtDfkz6vuxfLMwm9rTinJYtcAQ8ev3RN5L33g",
+   "launch": [
+    "mMaJT1qveTimLk3pnZURtBTJKZuduXSgXEhSybxMeBxfieJt5NYRkg842X45fVhVyq1NxxhyXh5vLuDMr21fKxt",
+    "4jvvsPzZYMDGCpwS3PX9Q2sVwoF5mcRUPyc6WLTMzsj522HJsHBYrZgjaiAY88MmNP9iDX6YmhZxHFBfiHoaD6KA",
+    "37zcsLb4jS7mYCBLjrCpJGCWxuC7n72KDT6ofLvTEnFJhb2Gps4qnMW6N7YZtAHDCUgJx9TtxxUVCa4JuefLJA59"
+   ],
+   "trades": [
+    {
+     "kind": "buy",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "10000000",
+     "signature": "27JCkH7X7xdDS8Z7fyP6CEjAZbrq2EnRqHU4YgSYJHeVTKD3J38DknsEHRyp3iv8aZTHzzbw5KQuW1SjmBgxeZ7U"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "10000000",
+     "signature": "64p4MKrKHG8nysnAgAqUAFU2pG4Ue5BgiAn3mdFPH3U54xSQkQxXmXynYuRTTGd1BTN7bVpZszVyMD2Wy681p6v"
+    },
+    {
+     "kind": "buy",
+     "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+     "amount": "10000000",
+     "signature": "3qsHFwagCA5utrjFG1RZSZe2XeX7SkrxQ2iSgngyS8qs8Bx43rexYbg53kpfcRwjRry7DxH22gGcAZBfVMUVYTz"
+    },
+    {
+     "kind": "buy",
+     "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+     "amount": "10000000",
+     "signature": "5ue6bGMTQCmdzuqH52mZ7C9mFgrwHRoLPkFYhvPL2cf6Y9ePUKHnxGaNoWPs5vzU5bBgfxqRfR14bmTxrhgv8Ez1"
+    },
+    {
+     "kind": "buy",
+     "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+     "amount": "10000000",
+     "signature": "3WXhmhuJJjBUAV88pRegJqHednKh5Lseo9zs64LhBfu5nDrcCBkFKkta3qqFm94hjTwqQgDzhEBByfNok1xhDnZu"
+    },
+    {
+     "kind": "buy",
+     "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+     "amount": "10000000",
+     "signature": "3hgd7j5FqzHupjWR5QB4yFAGr6SaKUroJLrT5cvjj5f5dcsKqyyq1CeMeBVDCwwshgKHS3jTYHPqxBTeh6E96Rur"
+    },
+    {
+     "kind": "buy",
+     "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+     "amount": "10000000",
+     "signature": "2XM8zf4qw7M5yqTu6XGbeTNux6UVxSB24aAgsd6CtwThCDcsaxtZHGEpVW36GY42qan3fXxsGw3MQGJnyt5naJLY"
+    },
+    {
+     "kind": "sell",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "48043654606626",
+     "signature": "3bd7Eymx5gDR2L3qHxek8WXh9Gbtbr75qrBw3ZCfxUdQdJhMFUB48YFPKYYW94xVu6g4GDc6G4hCywGXrcY9jQqw"
+    },
+    {
+     "kind": "buy",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "10000000",
+     "signature": "2g1N7AxuatTbvSZhakzssHxvZnYKDRuhxDnwAJz6QC5ymUenCSNx9VMSiqc9QDkynjbt7uixiNDj3kxZ6HjPj82d"
+    },
+    {
+     "kind": "buy",
+     "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+     "amount": "10000000",
+     "signature": "5nTDxQTwDHgTxsaiTZHKNW9yq8sh6Z3Paw5GnWHsCiVj6VVcxUP41HgWUcvLD4NVjKACaaaNBMzb8aLiqTbTC33s"
+    },
+    {
+     "kind": "buy",
+     "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+     "amount": "10000000",
+     "signature": "BNw24yn1VdNrsYTp4Vm9vafW1kGUfZHqz9C4gACqeRannnAUXM9YkpNnkET5nJRmcFm1NkGb99KwaUxjdBnZtyZ"
+    },
+    {
+     "kind": "buy",
+     "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+     "amount": "10000000",
+     "signature": "4qmwttrRYDHkhrzC4i7WGEMrCWsLrN7nMBpE8gaqkdomWpZmE5N6m4UpaLyDfqtBbZLB7KYRXq6QS3nGRDe88zZa"
+    }
+   ],
+   "graduation": null,
+   "status": "live",
+   "curveProgressBps": 3230,
+   "finalized": false,
+   "ownedByRouter": true,
+   "openPositions": 6
+  },
+  {
+   "label": "hot",
+   "name": "Trucee Demo Hot",
+   "symbol": "DEMO2",
+   "uri": "http://localhost:3000/api/metadata/c29d2a5a2bad9297",
+   "image": "http://localhost:3000/api/images/c29d2a5a2bad9297.png",
+   "market": "HLuLnRgjSFK6C6rgDFZkr7bV5NeAN9TcAGLpUL3jqLKk",
+   "pool": "3eZyB5Z8TxyF4ouZQ1fXejkqK2zKe1Z9E6jVUU6bf2kQ",
+   "config": "6caFj1H4Ct9fWacJsj97A7giwyKr3DzCFGtHUvp9kBFf",
+   "baseMint": "9sMfHpf9JmognbKf2T8pR6ydxXzwQQfpQAZVWw5Bkh2f",
+   "quoteMint": "So11111111111111111111111111111111111111112",
+   "bufferVault": "FqvWCHuW3fFWKeQSgrDVMpAn1htbRm7sjqmwfnHKAXXi",
+   "launch": [
+    "2F8k8xAgGg352hf9QYKUvyFPTm9ycKB7q2hEXY2CNkiyuwhdRy4Cam2qQKppPFwQu7CCnwxUjiSpoRvsaVBmy3so",
+    "4vJhxo35E6ZN8n6BxfunpqJoCPj2Fm9DL3YEYybir6DWTwEiidK7jVwUyGUfD95gAvbcRMXbHV3qpQjkKn72ZHWi",
+    "3truL5kaqwcW6qBK9whs8pDCH36sfZ4JaCuV4ssKFx1p5NACSmLdY9hxVb8in5aoajKqwqENnAAyGvyD3kWqrm2L"
+   ],
+   "trades": [
+    {
+     "kind": "buy",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "7500000",
+     "signature": "3syJDHbAmSbYHZJBcN5vCJLEu8n334zgC4CYYjbdXtsCZpSfqebrPFo3BBRHFbLHUbp8EMcGd1Heru9kyFtZnBYv"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "2E5J2CeQXDuYUhvM7nJ7CL9fhK6z3FndX54qqMKtW6Keu5bdefoe4dpCCVFKzSrpeu4KyC8wcuCj3Dnd9zAwc9Pt"
+    },
+    {
+     "kind": "buy",
+     "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+     "amount": "7500000",
+     "signature": "3RagagMUy4QCzhvGfAg5VprYps5NNhnCCYyVwcQLVpKxWdTiwrouf3gfyaFrnZPbT3SKx9x9hoR7weBMksHMgM9P"
+    },
+    {
+     "kind": "buy",
+     "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+     "amount": "7500000",
+     "signature": "2rhKaTDzpA5meBEqdKMwFbvsA8PUBeut3ny4QcS8LnyBHo8NCA1hYyiRdzzE29g2ryz6GbkmpeDULnVXiPPEzo5o"
+    },
+    {
+     "kind": "buy",
+     "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+     "amount": "7500000",
+     "signature": "Lhjr7stMCvLXFb2FzfHrRtcLJtUP37Nw7fiFrUX94oF4wAEiPMxPqzvbEWguDjawuCcchvXqTB515QnQhiZEZng"
+    },
+    {
+     "kind": "buy",
+     "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+     "amount": "7500000",
+     "signature": "36MGhmmUZmJ9AQpbS62bWedKXcrKtchqSiXz32weAkSCH5H4fb55CbxvspEvJuHTp2C45XXhY3g7Dsz2wrUFqCNv"
+    },
+    {
+     "kind": "buy",
+     "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+     "amount": "7500000",
+     "signature": "5cKWkherotzG5LP3dmFKjYRCuzDXYLzJPxmWGrxU57B3heNW25HYJQjZFPZxoLjWhZcF5G15qV1z1XhMCexXDK85"
+    },
+    {
+     "kind": "buy",
+     "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+     "amount": "7500000",
+     "signature": "2DQqg7i1t3zsZ1QMXNxAvbvqQADfCkMaaJqNwPSYWv2jtwh7EtMkGoYvK4nMyKUE5zm1aftWRsFRfJF8Xau7hAQh"
+    },
+    {
+     "kind": "buy",
+     "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+     "amount": "7500000",
+     "signature": "Mb8KAaVxoe25TUi9AT19FP8LAjRPuc9Ra75fScK7ChxbWKyo8iX1jEw3NH8z74voSZKQFXs95DkJ6x8i4mkdvRP"
+    },
+    {
+     "kind": "buy",
+     "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+     "amount": "7500000",
+     "signature": "4paXin897wAXEQXKBw8y2vS4xfKATEeyXAHkjSwmuoZAEfSLQ6PY3AGuM3sc6JgfKCpSmuUNAT1tgyJ5KSbdNa2b"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "26qikSJZMNpkJAGtGmZ4nNXKseJnwhGM6Hdi2UjQ5VwmLWBD6b9AcBf75WUT3akRCVTHz7LoLMyzJ4exqTrqcQ6E"
+    },
+    {
+     "kind": "buy",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "7500000",
+     "signature": "MoXJmg1zHGfLh2a23MYKpLB5xABzpt9UV5uP8RK7rbNwFSpLB3V98Ppne2h2hm8aZyNWViSAmCTRQd2TNAcMmaj"
+    },
+    {
+     "kind": "buy",
+     "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+     "amount": "7500000",
+     "signature": "m1vN8YLewEG1wbwsJgdwzgVAaaGEgjN2vceQg4wfThwtcMNe69mPttasjvFNXzhoNhhjJqzY6YY5eSZ6bC5rieW"
+    },
+    {
+     "kind": "buy",
+     "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+     "amount": "7500000",
+     "signature": "3GxmaH53ixAbaFiQScgy4zz5zJf88V1nLznLoaQ6YVu9GpcgK1cYVpRkRkdswFb8tqSbdgBrPfKH2p4yextBoY8X"
+    },
+    {
+     "kind": "buy",
+     "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+     "amount": "7500000",
+     "signature": "2XWpxv62jDJMDjrMQ6zPpQySCmqdsBpeb6vkqRpBsUvTSmRh5yB43onTKJc6M1JdzVqTxSW7BffVb9fdqVaH14ur"
+    },
+    {
+     "kind": "buy",
+     "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+     "amount": "7500000",
+     "signature": "2eUs8mwEAD1NKnGAWtt8fmKXiCHwHEkYWTk8dtETBRKEVWRyuohqQQwYamW6DtbNssXCfQvTpiHocoGznEwqcJp3"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "4de1PS6ZCuaejj4cvu7sjves1rXiUhp9aKpzqrg9SjLp6VLkjQ1gw81LzrgDDBZBTFBhNHBv7nWh4Yokcszj8nBX"
+    },
+    {
+     "kind": "buy",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "7500000",
+     "signature": "4orA55W46R16Snmf4CU5fyw2kCeqrxiKGqqH1U54aT8UTsCSj3oH4fv7qQzzp4QtfJQeHMyY1sN7GD7j82yKW8or"
+    },
+    {
+     "kind": "buy",
+     "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+     "amount": "7500000",
+     "signature": "3hKqpNk65YisjL9Wnu7TfH28K29h1YcL6YTS4EKg7rADXXpTs8etwgTT6DfpvvUm3s1NDSuGcXAiFhj3gCGgddFb"
+    },
+    {
+     "kind": "buy",
+     "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+     "amount": "7500000",
+     "signature": "5GDaQc7KZhABdC649ugW25G5WKfyvJQ6N3TE8DBC7Z5zY3QgfFBoa85AU8PNhacZY7fYGWJpuuKUnQWJyqQD2bNp"
+    },
+    {
+     "kind": "buy",
+     "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+     "amount": "7500000",
+     "signature": "3B7yTwtbSGSz82ZVPxiCU9beJTsxtXWmBFdW3ekJoGoNCSmLPtxJq21wQ28GYd1iLTezMMnBpEyWhi19amk6x8pU"
+    },
+    {
+     "kind": "sell",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "33528927664471",
+     "signature": "2sutmsxL1at4kj48QqiSnR8TumbXskiV9a5dkarvfYEKsrFyDciCmQj1VeYiUev4KuyN4L8bjBuDHfntBpTFPf75"
+    },
+    {
+     "kind": "buy",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "7500000",
+     "signature": "44tQCsjaepyiA8hYXJWeuYDKGVueNAeVXYwj4FLouWYwGjeEX52X8AN5MicYb2wJmPJn4AEwH1ggdfsRZJD6aHaF"
+    },
+    {
+     "kind": "buy",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "7500000",
+     "signature": "5JWMzDwDuLAGpR5oDZCgN92YdefoGGvWvbZwyE7yaUSBHbMhFvBvJUpbfyoYZ2UpBXgnEJJ6GrHaZbTTxbUMS1gn"
+    },
+    {
+     "kind": "buy",
+     "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+     "amount": "7500000",
+     "signature": "5p53NcnpKgaFeE7Xg5WjTau7rh4mfxpnksRSQcVisCDhYHXBAyHYQYxcb75E4QS8XEeesyjb2pntgytTEE8Cvyqw"
+    },
+    {
+     "kind": "buy",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "7500000",
+     "signature": "5iVAJ4G4a58M2tJm8wdhBzbJNrgfzHsouv6gFZBG3vQXHVHwgvCaFFG8241V3HPzBXhvqPeghAdvYDSdqSpyg6AD"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "371jEm8m7hJQcijn1iy6pzGE1s3ZEadcwtKyUHuc5GDYHXsWgUf2bx632AhTWCyfVie32avfEM6oF7esBJRuMd6o"
+    },
+    {
+     "kind": "buy",
+     "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+     "amount": "7500000",
+     "signature": "tg17jKA4F8fzN9ew7NCbMw3Mj4WXZPR2xn5FsdXefvAUM3BBX53vnkwYWDv9oM6BFtY6gy2cVJeNKVdNAiKx3xn"
+    },
+    {
+     "kind": "buy",
+     "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+     "amount": "7500000",
+     "signature": "5GgG5u73xU2nSxAdyYsr2eiLPwdb69imUG7baruKXtpFZ2Xw6M74mj1EAQKrpZZQAzyXwLmJ2ukNrEFWYeaD54kW"
+    },
+    {
+     "kind": "buy",
+     "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+     "amount": "7500000",
+     "signature": "5z7ZLijbM1mXexw6fzPYMruvGLue7KMjy82rQ6Zu7PF99M1tMjEDKBdJ5Ttc3knJRvUBbeRqr7hinjaj99qZ8yPD"
+    },
+    {
+     "kind": "buy",
+     "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+     "amount": "7500000",
+     "signature": "28WEtv2cYxCmZnviptUC1ECgLss8bwGfqRCFL2z8Jgj34jujEkf3f7pu3xGVqiEceb74TT9jmjbjE5yXwvQnrgwt"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "8FBRumJiMdYrkX4DcCqMMHzg7uQbAHCzxtQnb45KyoF6cjLESYzGeSkAsUUMbUsiYqMuYfRdfAkzvzu5e6AToen"
+    },
+    {
+     "kind": "buy",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "7500000",
+     "signature": "3d63HMyy8CG3Ve52mQnnQ9Nx22FHeCuTDem1do7tMQXr77Bmt1dQmVutA2n3Wjhs4Fd4VPjmrBqiqdkXnYYCaQnb"
+    },
+    {
+     "kind": "buy",
+     "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+     "amount": "7500000",
+     "signature": "2R72Gh3M69zgxsumL2aiZhxzFB6RbDktecS61za3T5BP5KS3yyJzJmmmawqTZfW8c6sjkcdD9pw5rPxdp8whJJVj"
+    },
+    {
+     "kind": "buy",
+     "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+     "amount": "7500000",
+     "signature": "4SChzm6uL7gU6U7aKp8g3Nx6MXgPxxwrDfBPyXpojPfu2t8ooDs6AbSEfsmbcdtigGSJ5mwrVWZXDREqWrNai7yg"
+    },
+    {
+     "kind": "buy",
+     "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+     "amount": "7500000",
+     "signature": "2VFskwn5khvYYvRKE1t5uPMowLRGPwKw7gSSUQexzoAK53o55UsmBSESY3MjnWL1PYYRMocogbTbHW2AoE5tf1zz"
+    },
+    {
+     "kind": "buy",
+     "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+     "amount": "7500000",
+     "signature": "5PL7thQzcenACUoHnLusQSTkP4yvSWSj2gdQL2995Xyi9KYGJfRPeZXViDjr6HscjDCpPPSFpRyQ1gB3Sz8TPqr4"
+    }
+   ],
+   "graduation": null,
+   "status": "live",
+   "curveProgressBps": 8274,
+   "finalized": false,
+   "ownedByRouter": true,
+   "openPositions": 6
+  },
+  {
+   "label": "graduated",
+   "name": "Trucee Demo Graduated",
+   "symbol": "DEMO3",
+   "uri": "http://localhost:3000/api/metadata/51f2482dc766cc20",
+   "image": "http://localhost:3000/api/images/51f2482dc766cc20.png",
+   "market": "Bv2aYyv3ku6bCgAVNUyMT5auTNwt4W2DmH1CbhCTprAK",
+   "pool": "HmYUV5CqfhazhDLUjHv9orUJ2iJVK7jci89GyaQX5FBt",
+   "config": "52dqbnKPHTFy4NwyH2uFXje6WzrY2BwhTF1J4xXpK1Fh",
+   "baseMint": "H7tuWMPnzX7NDRSoNagZ4FCe9Q89NqbSsor8Sa3FwmKi",
+   "quoteMint": "So11111111111111111111111111111111111111112",
+   "bufferVault": "2T17jcnsweaa1siiyr2F9yprgWBRmMTNscaMjhGeXAM1",
+   "launch": [
+    "5BCSc2JBpaNgu3xArKwtnUEPHLW1TmHRxCLRYHeX6iLfioQEmCAoug3wRQvSomBc9JxE8pxyAqeRnD8ng7gW4CbY",
+    "5fiAcNcRbusHdnjYGNs1rFXUN7CWLEx3wmL4vbLVvi21o14QqJ6BiUpUTbGmWGhQa3cTXtsmZk9UnJDWwPRXfUku",
+    "48ifTyFk3HXAtaCbWKMSzSfuPU3qHH9oXnooZaaC8aA1amtRTQ8jBLamUUxCqAcRQxFQcddCs5k8W4kgRaH5JQai"
+   ],
+   "trades": [
+    {
+     "kind": "buy",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "7500000",
+     "signature": "3CtMWMmRHxTew7RrxhfhbnRvnc1yZec9xkvB69sCfFu1eqPpWHcewK4iqSYku1VwryZVka9HXvF4sNNBknnj2kLC"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "32Y1SUHxfLFGcMobmHhoNuGexy2yDPTDw7pCggpk7QvE1gi1udQG1ANNJriCNRJJvT3X4ZNarkg6Ja5sQMbhnzfT"
+    },
+    {
+     "kind": "buy",
+     "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+     "amount": "7500000",
+     "signature": "59QsJLzsfuvQVXndQdaZubhkxUFFuqTTQF1CuCTY2iuyjriQRWDtphwnhLq4tYYdpjM4RQTqKAaHTy9F6hBY5FHe"
+    },
+    {
+     "kind": "buy",
+     "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+     "amount": "7500000",
+     "signature": "42gzwjMXSR7Yt4h1nzqYYXBDHP13wKvSRzEc1xUL9yYzaKkFgcSxUmRkTuJoMBwyGJPj6HT6D8yKVk8A3etqbGGH"
+    },
+    {
+     "kind": "buy",
+     "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+     "amount": "7500000",
+     "signature": "5YFYKUEvnK611voZyfku2wDncqTQkxyD6tYaimjtRAkPW4vVQJdL5inX2mweQb7W2P328VSv5q3sWv4KGS8mjZPW"
+    },
+    {
+     "kind": "buy",
+     "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+     "amount": "7500000",
+     "signature": "CDGggMssLPmANfMJ3muJWeTf1Xs3Ahp6cNcicG9XHad9JEu6iVBU2FdpBCMbDzupSGyfvVPBCvhVD9REGNXRSsw"
+    },
+    {
+     "kind": "buy",
+     "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+     "amount": "7500000",
+     "signature": "2bfBuJFjP26CaT5qqmTJqcj2GFFAUcJmNXwDSWicMUngcfED4Bs2HCie5emoKhysyEkLhgtZRZMQR4w4gFBWo7XW"
+    },
+    {
+     "kind": "buy",
+     "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+     "amount": "7500000",
+     "signature": "38Nik9zfT9bDj98EcvXV8ZykEbBk6N2Yp6byvfrs1YYgz7btgAqG6nuzQae3gByDRm1pVVZ91Z9KtoSoPgGVxpc8"
+    },
+    {
+     "kind": "buy",
+     "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+     "amount": "7500000",
+     "signature": "2iqH6uLQ7A1pFqGm1LjXHMJ9mJ9rEoVDM8PvntJisiAEV65KEoU7egoDj9LKze4GTrb1wbnPeLoyjUxsche9EjTG"
+    },
+    {
+     "kind": "buy",
+     "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+     "amount": "7500000",
+     "signature": "4CtrMzm8zymwrawzfrAhJg5CaMDMgMsquT7twhZQLqfV7Z4WBbAKnRyEWmPNUPqhG1V4T1gjBQJ31mBTLcCbBs1i"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "4dyut37B8gqSZz3AjpnJE6m5tD9p4qxvkUTqsmgz6ZKeygN4esqC9mJAH1mstWhnSLhHdxehfb8Dapmu3r7fpnTM"
+    },
+    {
+     "kind": "buy",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "7500000",
+     "signature": "57pgi5T7eiYsEvRPHCjSKHfj99YXsgaKwz78y1p2eYj4BiKN2aC1DfdH6WYT6Zr9hF6ean5fSEEpcVUEBWyBEFAY"
+    },
+    {
+     "kind": "buy",
+     "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+     "amount": "7500000",
+     "signature": "4BLHyXvtKW8GcAETwUSWe8Lbzi6q4t3GLWiadpYrPBjz48oQ4T647hxSyZPkP9rtF6YbmxtJpmYKsGqbUnrueCvE"
+    },
+    {
+     "kind": "buy",
+     "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+     "amount": "7500000",
+     "signature": "3ThgFX9gBYnCpe9C5N1yGkZ4xpbFZSWxUbsnYKE1TJMFuypJx51AWbm52oRnTr8SgSME7qpUNkZYU8nzrBjBwShc"
+    },
+    {
+     "kind": "buy",
+     "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+     "amount": "7500000",
+     "signature": "2gekCebpG2BbtrAj4zUD3dXzDRC32UqXBVSTdEnKWqBwn8AVQcbBMweFBxKvDnJ587sqiqyz3YVEzDsk39LECoYU"
+    },
+    {
+     "kind": "buy",
+     "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+     "amount": "7500000",
+     "signature": "4bkMqrzP1yuQQPkTJSh282MMoyCMeasnGMd1RZCv6gUtx4DnjrsfqFZ15ebRPeVBDJR7eGH5qUn9aLDoUj34XWHx"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "52tDjBExotvbZQERMJMrDmvaCXgo7LxFwWWzCeYjV3W1K7MQLPyBnP9KbA2SheWHN2CM6TPFWndEMxW7K8hmPCVo"
+    },
+    {
+     "kind": "sell",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "52606020039798",
+     "signature": "2kdPAfJRz8CKC3tbLm2vZomqds74R5vavjyXkcMZhdgVNFeasWMRRr4X7he1Lc2HuhBAtbGJi4LbNw6QMqPJ9DFZ"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "4pGjwcLeJfZ5sKtV74Ycw5bLM3h6HBxsQ6U8mV6dpApN5DUPjTmnFJeTk8UKVreW41YiyjksoZV8ci2d4t394bHg"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "44FaX18vhU3w8SEBJndQoac6PH2qhrLAf6X28FhJ5GjbjjgFfuj28v7bD6GLpGp6nfTryneXM54v43awaR8H8bdS"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "YQXP27CQphqnFEZnLEEZhdhKds6iGQMirSEU5w5W2QiEYtFsTTtpashHkGC5wd1FoUS7EPp1YJ5Uuu91H4D85D2"
+    },
+    {
+     "kind": "buy",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "7500000",
+     "signature": "4txoDenVPKssFdXYHrLGeVw7bgSYY7YvWPAnqGZFZubKsnFiqY9dyPKGVSnHj1AM3u2ddACB731QLmgfTYisDTTY"
+    },
+    {
+     "kind": "buy",
+     "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+     "amount": "7500000",
+     "signature": "5ebxoimt5zAoErd2N6rEt3Gdn74rQTNEYrYot1DdmRB5Lc36YzKhcLBsWeyDX3aH1oPKREjamoocdWnVPqwmxeHN"
+    },
+    {
+     "kind": "buy",
+     "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+     "amount": "7500000",
+     "signature": "5E4sqELKjXzuVEidvLLhbPqoumo6GiUyvqrccUviDPpsFRb5croZgzA9322PWGJqRZGR7yRo3LSN5rbi6nn6Fibr"
+    },
+    {
+     "kind": "buy",
+     "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+     "amount": "7500000",
+     "signature": "64WWMkK4CZy1juudkMTfP3Kp5ZBXFuZWh1XoEueHcXuDbDM9V7fCCfrs18tMwZDuxGRe1xuna2bDsYt6fHCbgsDr"
+    },
+    {
+     "kind": "buy",
+     "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+     "amount": "7500000",
+     "signature": "4rYYKwNKLyjsFHSpyaATAiBbLezP2L2AoZe2W9JnqGjk2UsiLdBPVgXTmThVw3Ez7URQuNo1kZaen85PEvgfvDGk"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "2LDLdjgfp29CL3XiiKcVpM6w2rNLjTQuFH2scCq5ee2qUPDY9ab5aeWQ5vmAc3C7GzGbjBKQMwqTScxiJoe66kN1"
+    },
+    {
+     "kind": "buy",
+     "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+     "amount": "7500000",
+     "signature": "3unNApEvE9Bc3dP7r4JZKiNrdSr8M3fSuwpRkkcBRuMdeUxquUwnFWrDRu4bfuD7c4oLMTn6ESEpHX3hjGU1paeH"
+    },
+    {
+     "kind": "buy",
+     "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+     "amount": "7500000",
+     "signature": "5MTPnUokVVPTMjvFN1BnEm5dTq4yfPyF9PnQMxfb2jsqxxQnEukvniwJdbDUBGBF8xV55tJJobmxdTafTFvtLriD"
+    },
+    {
+     "kind": "buy",
+     "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+     "amount": "7500000",
+     "signature": "3vi2H5xMFaVupU2rzLBa2bfa68TXfBqX3RZs2K4R9QVokQ7PBtRAxDHvwMQTxRSLyhteu4gAKQKxhdzf2kQR166E"
+    },
+    {
+     "kind": "buy",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "7500000",
+     "signature": "33D9wdSgcUhevVXEvVDui38Lt6jLkmtojdzDSso2LmMEvA3GvuKQBMLjXG9BWAevmGiemv64CXewz3fnQYDozEtb"
+    },
+    {
+     "kind": "buy",
+     "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+     "amount": "7500000",
+     "signature": "gE2X5uAYteciyXksriveMHQBN85Wx47MqvEJ1kX2GDzuC1xteXBtbfZmAxuQhh8bAqkWnz7k3WLMsDLttyV8jqg"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "5ppCpYQZ61fNeJYCWLwivuvJtqBWGAoUeqZimfHvRCNrdRSXsc7wht6MjvqAmq3KhuhS2fFJRB5pHQsCdWJEtw8t"
+    },
+    {
+     "kind": "sell",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "37090096359978",
+     "signature": "4W6Qy9HUhUG59F6CnJ7zqVgvbCzaX7kRxkjGcFkvaS6dApjh2X5V7USA8QVoWoc8NLsAUMaoEuyGzzr9tgPwR8kt"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "5nsA8C8ePocFrqsf77VERRiN4XXuhaHuiReyN9fqg7MH6YpKnJn2HtEFyB5gRKUNsiwSaoASGtp1MnEBqh1Scpwh"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "3YXX1nQaRF7bKCTA6LnxBBnv8jg83ko2EzQR2KCB9dWMKf2YNtYocmicUBxib7hhipbpSqpep5vZyJNXP7bdhFpc"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "231U4sNPKH1nhweohqJQzr4jr7W2BoukcujcZqsHxtvf3jmTjfGc2ck7bfkmfZe5V7VWw5FYvtYKhhjevWW5WWQH"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "3kDzk8nQY1fzRi4Pq7dyv2Zi5zLAyHdUdDSvgQSFvfBwTuU9TFBLUMWWxox5EZMnZMVJDUbHwb3yYARMh1SpJR7R"
+    },
+    {
+     "kind": "buy",
+     "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+     "amount": "7500000",
+     "signature": "UceYjvKnPKHeV5BjehrfscytwZi3SYEhzRTDDcLiKgFCsdUxapzbojYz42BidaWTx1E5ycCSKmfBvV38fLscR6H"
+    },
+    {
+     "kind": "buy",
+     "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+     "amount": "7500000",
+     "signature": "21NnQvhgg15Bzg44zhyhzyRPB4eeUggVRoYWSU3bAG3TVTYr8i73RU3qkEeWpxugzdfRoXbsbqe1iTDJSrLMvrXu"
+    },
+    {
+     "kind": "buy",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "7500000",
+     "signature": "2rSbn4VvJgUuq59yrSUofkNSQSV6QXse6J7RaeJvcCPV9MTGAekpRErwjEbFMtGWUtPuWCreSQ9snsDhxzaqosR6"
+    },
+    {
+     "kind": "buy",
+     "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+     "amount": "7500000",
+     "signature": "4snePJsHLDfjVM1h8k2NGjSkRkh4a7qB5E8WKdmRPyA2ybdjmyAsdto9SYnbfHQztAQTiEv44aSSbjGbyUb5obSk"
+    },
+    {
+     "kind": "buy",
+     "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+     "amount": "7500000",
+     "signature": "1ayNGKQCJaBPRsbEbda2eUGeKrfEJwxFj32a5nJycmmn33M9xuHHUGJLXGqzFTek3xRvysVqESeaHqXK6eLvZMa"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "2nZT1HwVPM3f7ggqwnt1kYA8kwETyiDcdzam5yUcH87KtCFh9mz8tXP1q5xeUTHaZcin7pvJTBF9oja6hiNTGTv8"
+    },
+    {
+     "kind": "buy",
+     "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+     "amount": "7500000",
+     "signature": "4PfB7uY6EXZcdzbYeq8torvkE152wxKppBS9X91NmxxUSPd3csBVBmTbFSt5tPHSNvcH6mnLvrAxqfGa1MnJKBRi"
+    },
+    {
+     "kind": "buy",
+     "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+     "amount": "7500000",
+     "signature": "52hLbpqqGb5Hwy8zHPWJUvzzXxCYcCNGAMifk2jB47Pof4buhGR2rjehQNmpc8qdFD2aRt7L4zuKUFqRoP3ZisDT"
+    },
+    {
+     "kind": "buy",
+     "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+     "amount": "7500000",
+     "signature": "2wgeJNAmmHNEiHtcPSAKZ1DzLzzCW9r7YkzYFc7Lbtvo3QovYaizsYvw9N285ennPq6y1H3TQwjwN8PjZmNinvpz"
+    },
+    {
+     "kind": "buy",
+     "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+     "amount": "7500000",
+     "signature": "27GrroQddVTYYKG8gJjCWme7HeZcTPa3jAX4DbpV6xvQddsY8KCDE5Bn1sH3MhCQ5r9xSAiLRtYwy7rVmicNiF6L"
+    },
+    {
+     "kind": "buy",
+     "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+     "amount": "7500000",
+     "signature": "DWuo2d5Nx83LUj1WafNk1e4ZmKMrDFHkF5WFeWrjwhdd27fejoi1FMTT4g2JuSqZaNoAkciqLAj33onA8wwL93V"
+    },
+    {
+     "kind": "buy",
+     "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+     "amount": "7500000",
+     "signature": "tpJq9M78BtUcm9TpioPhgZ5yhB9N5qJabh8BWTGunTqZHBrZo93wK1Btv8XCD2FzDr9e4jc97oLQdoZd42nW1i3"
+    }
+   ],
+   "graduation": {
+    "finalize": "3LYgkJDdKRXpViEetbqPCQEZnxXD2wFht5JRm4nRZq6aG7YGxDdyBb4DrL89ubufJteQVxeKfK3iRz8pvCQGiHHi",
+    "claims": [
+     {
+      "owner": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+      "signature": "3S9ozQDVNQGg7ZgBAJwRV5XhL1qcwRsZThefvU1YrsEtsa4WcXJbKg8wQdmxJfnqD5pmSXWxBorTunnvPibxHrjt"
+     },
+     {
+      "owner": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+      "signature": "55xD1cauDwB4dkRTkSBVNxHQdBDvkMF5bftYYjtzXDjfyEeLoefGw7vGqAoWtZ7DinrH9V4PnXSyBozjVSmradzT"
+     },
+     {
+      "owner": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+      "signature": "3vkJjTrLZr5XAsmvTcosBprpQoBnt7pZMnBo5rUMDJS7GBxpKwMzyR2D64QxUEQnpxcD7u8S8GqvQPC6PEU9ibFH"
+     },
+     {
+      "owner": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+      "signature": "64RzP8Wnp5yPseTfcB4nv5ZP1QfpKg73nqiUUaueEEcLZQpXbQ1KHtk4Xiv6QR3ixdHR7uia8ZCGvtpJ7AtM5FPJ"
+     },
+     {
+      "owner": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+      "signature": "4j9JtCbNby6teXmYRqk7Cua8qE7UCgTkeUsGof3bRv8fm8Dopgm11zV2QbwikBr4n8wqstAk7hvmpiAyHTBYkMX6"
+     },
+     {
+      "owner": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+      "signature": "3etgLCQwPaG5raCHwYfggSC9BqKUMeLqjqPhvwyhmMqtYThv5aibUAorhmQapPJxVr9y8FweKMkB5ZJht8L7Nhex"
+     }
+    ],
+    "migrate": "4up745EVJXcz1DZmMmt6eXFXhNdWgvAkRUH4by1Hnu1ArQuxwcUXaJvNVZf9x176uw5TH389ut7qomTnHd9v2hz7",
+    "dammConfig": "7F6dnUcRuyM2TwR8myT1dYypFXpPSxqwKNSFNkxyNESd",
+    "dammPool": "GK2DbdQfohVv4rrKyjXn7oqbdaYYfaotBNkKMyDcRtsM"
+   },
+   "status": "migrated",
+   "curveProgressBps": 10000,
+   "finalized": true,
+   "ownedByRouter": true,
+   "openPositions": 0
+  }
+ ],
+ "sweep": [
+  {
+   "trader": "9AxWS2486iRck9ifoXNHp7tvHKMq63eTCxF3capRMWLW",
+   "lamports": "19933109",
+   "signature": "wYQfjRzv2XqcbLuGbaWyX7Tmg47NYb3hnp6vbGZCxVzmJrd1HMZGh5aZNHb6b2HqJkpP6H19NGKVHWYr86DqXd6"
+  },
+  {
+   "trader": "FAYd41WeEiHMobpE7ZBgGYh2A6dDassxcGz23wD4QnQh",
+   "lamports": "36647678",
+   "signature": "4eWBNXtCRJeLA2wnZc74iMJvRJs9sLvDUnvFmMTbNdRU9GJbCznZ9unaivmyRuo4v1jdg8AitNYo4rkvsJc6W4WH"
+  },
+  {
+   "trader": "7KtJAbuH6ZG38Hbb1ouDqBsS76bAAwYTfffVbiNveajc",
+   "lamports": "9047883",
+   "signature": "9pYHxqo3rs5XhH3AzTTXNs5ocCNF5ZHj7V4c32jXUR88gtm2y2cCAAtQr4vxSSGG6RwVnnSNKFVeZKGpwiSG8Lv"
+  },
+  {
+   "trader": "Cg98cVQFo1JkLDwLEV7Ao3RpZcjfKF7ijyTth9tc54Pj",
+   "lamports": "9047883",
+   "signature": "5vVrCUjxZ6Fh2j5cEWauEr1NK1SVs8ihg1nkvQ4FFzPBNfUCnreZoQi9RVD8wwjzoVBkDKuNdGU3Tyi1segrWCUd"
+  },
+  {
+   "trader": "ByYmBMsiMVSxp8KNNaNQp7Vs3cvNhrynykk4BQevXbG8",
+   "lamports": "11468949",
+   "signature": "62FRkG9acHujSoiDLi15r6goRkQ5c9aVKigvHD2WDqVBvZRzShvDGvAsymhwsom9JdURkFhx6jYpdWMzDeSUrqEd"
+  },
+  {
+   "trader": "G7JvQvQiDHRJKJf1znFHzfQy6tV63zr9H4i8kEutLsxb",
+   "lamports": "9047883",
+   "signature": "4tjw3LGwizQXSGimM63eJDSXRMKTNEnywuizRCZepH5ztWNtTxvXbmKwrHnF5nY7QPoCgWVZiZzC9CY23t3roBe2"
+  }
+ ]
+}
