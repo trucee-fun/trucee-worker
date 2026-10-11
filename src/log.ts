@@ -38,7 +38,7 @@ export function registerSecret(value: string): void {
   secrets = [...secrets, ...new Set(forms)].sort((a, b) => b.length - a.length)
 }
 
-function scrubSecrets(line: string): string {
+export function scrubSecrets(line: string): string {
   return secrets.reduce((text, secret) => text.split(secret).join(REDACTED_SECRET), line)
 }
 

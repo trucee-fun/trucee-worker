@@ -2,21 +2,34 @@
  * CRK-07: the worker entrypoint registers every crank job, in tick order, with the guards of its env config; it never
  * exits as a silent no-op when started; and it scrubs every part of the RPC URL that could carry the API key.
  * CRK-13: finalize gets the env guards too, and library output on stderr is scrubbed like a log line.
+ * CRK-14: one scrub covers stdout, stderr and every console method, and main() installs it before the config loads.
  */
 import { execFile } from 'node:child_process'
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Keypair, type Connection } from '@solana/web3.js'
 import { getClusterConfig } from '@trucee/sdk'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { DEFAULT_CRANK_MIN_SOL_LAMPORTS, DEFAULT_MIN_ATA_VALUE_LAMPORTS, loadConfig, type WorkerConfig } from '../src/config.js'
+import {
+  DEFAULT_CRANK_MIN_SOL_LAMPORTS,
+  DEFAULT_MIN_ATA_VALUE_LAMPORTS,
+  loadConfig,
+  loadCrankKeypair,
+  type WorkerConfig,
+} from '../src/config.js'
 import type { CrankContext } from '../src/crank/index.js'
 import { createAutoExitJob } from '../src/crank/jobs/auto-exit.js'
 import { createClaimsJob } from '../src/crank/jobs/claims.js'
 import { createFinalizeJob } from '../src/crank/jobs/finalize.js'
 import { createMigrateJob } from '../src/crank/jobs/migrate.js'
-import { log, type Logger } from '../src/log.js'
-import { buildJobs, protectRpcUrl, scrubStderr, shouldStartWorker } from '../src/index.js'
+import { log, registerSecret, type Logger } from '../src/log.js'
+import { buildJobs, installOutputScrub, protectRpcUrl, shouldStartWorker } from '../src/index.js'
+
+/** bs58 comes with @solana/web3.js and ships no types: the wallet export form of a secret key. */
+const bs58 = createRequire(import.meta.url)('bs58') as { readonly encode: (bytes: Uint8Array) => string }
 
 vi.mock('../src/crank/jobs/finalize.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/crank/jobs/finalize.js')>()
@@ -135,10 +148,20 @@ describe('buildJobs', () => {
   })
 })
 
-/** An RPC URL whose path carries the key, as a library would quote it on a connection error. */
-const STDERR_HOST = 'x.invalid'
-const STDERR_SECRET = 'SECRETKEY'
-const STDERR_RPC_URL = `https://${STDERR_HOST}/v2/${STDERR_SECRET}`
+/** An RPC URL whose path and query carry the key, as a library would quote it on a connection error. */
+const RPC_HOST = 'x.invalid'
+const RPC_PATH_KEY = 'SECRETKEY'
+const RPC_QUERY_KEY = 'QUERYKEY9'
+const SECRET_RPC_URL = `https://${RPC_HOST}/v2/${RPC_PATH_KEY}?api-key=${RPC_QUERY_KEY}`
+/** The URL without scheme and host, as a request line quotes it: only the registered parts, no URL pattern, match it. */
+const RPC_PATH_AND_QUERY = `/v2/${RPC_PATH_KEY}?api-key=${RPC_QUERY_KEY}`
+
+/** `output` names neither the RPC host nor anything of its path or query. */
+function expectNoRpcUrlPart(output: string): void {
+  expect(output).not.toContain(RPC_HOST)
+  expect(output).not.toContain(RPC_PATH_KEY)
+  expect(output).not.toContain(RPC_QUERY_KEY)
+}
 
 const WORKER_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const INDEX_PATH = join(WORKER_DIR, 'src', 'index.ts')
@@ -160,8 +183,49 @@ function runNode(args: readonly string[], extra: Readonly<Record<string, string>
   })
 }
 
-/** Imports src/index.ts from `node -e`, where process.argv[1] is undefined, as another runner would load it. */
-const IMPORT_INDEX = ['--import', 'tsx', '--input-type=module', '-e', "await import('./src/index.ts')"]
+/** Runs `script` as an ES module from `node -e` in worker/: process.argv[1] is undefined, as under another runner. */
+const nodeScript = (script: string): string[] => ['--import', 'tsx', '--input-type=module', '-e', script]
+const IMPORT_INDEX_SCRIPT = "await import('./src/index.ts')"
+/** Imports src/index.ts from `node -e`, as another runner would load it. */
+const IMPORT_INDEX = nodeScript(IMPORT_INDEX_SCRIPT)
+
+/**
+ * Turns os.homedir, which loadConfig calls to expand a `~` CRANK_KEYPAIR, into a library failing at config time: it
+ * prints the RPC URL, and its path and query alone, on every console method and both streams, then throws an error
+ * quoting the URL. Patched before the import, so it fires inside main()'s loadConfig.
+ */
+const HOMEDIR_FAILS_QUOTING_RPC_URL = `
+const os = process.getBuiltinModule('node:os')
+os.homedir = () => {
+  const url = process.env.RPC_URL
+  const { pathname, search } = new URL(url)
+  console.log('lib log', url)
+  console.info('lib info', pathname + search)
+  console.debug('lib debug', url)
+  console.warn('lib warn', pathname + search)
+  console.error(new Error('lib error: ' + url))
+  process.stdout.write('lib stdout GET ' + pathname + search + '\\n')
+  process.stderr.write(Buffer.from('lib stderr ' + url + ' ' + pathname + search + '\\n'))
+  throw new Error('fetch failed: ' + url)
+}
+process.getBuiltinModule('node:module').syncBuiltinESMExports()
+`
+/** CRANK_KEYPAIR under ~, so loadConfig calls os.homedir; the file is never read. */
+const HOME_KEYPAIR = '~/no-such-keypair.json'
+
+/**
+ * Points the worker's worker/.env (absolute path in WORKER_ENV_FILE) at the file in TEMP_ENV_FILE: the real loader
+ * reads the temp file, and no worker/.env in the checkout is read or written.
+ */
+const WORKER_ENV_FILE_IS_TEMP_ENV = `
+const fs = process.getBuiltinModule('node:fs')
+const { WORKER_ENV_FILE: workerEnv, TEMP_ENV_FILE: tempEnv } = process.env
+const exists = fs.existsSync
+fs.existsSync = (path) => path === workerEnv || exists(path)
+process.getBuiltinModule('node:module').syncBuiltinESMExports()
+const loadEnvFile = process.loadEnvFile
+process.loadEnvFile = (path) => loadEnvFile(path === workerEnv ? tempEnv : path)
+`
 
 describe('worker start', () => {
   it('npm start and the Docker CMD (node --import tsx src/index.ts) run main(): an invalid config exits non-zero with the config error', async () => {
@@ -186,20 +250,72 @@ describe('worker start', () => {
     expect(run).toEqual({ code: 0, output: '' })
   }, SPAWN_TIMEOUT_MS)
 
-  it('main() scrubs stderr once the config loads: a library line quoting the RPC URL keeps neither its key nor its host', async () => {
-    // A missing keypair stops main() after the scrub is installed and before anything touches the network.
-    const libraryWrites = `process.stderr.write('lib error ${STDERR_RPC_URL}\\n'); console.error('ws error:', '${STDERR_RPC_URL}')`
-    const script = ['--import', 'tsx', '--input-type=module', '-e', `await import('./src/index.ts'); ${libraryWrites}`]
-    const env = { CLUSTER: 'devnet', RPC_URL: STDERR_RPC_URL, CRANK_KEYPAIR: './no-such-keypair.json', CRANK_FORCE_START: '1' }
+  it('main() keeps the scrub after the config loads: library lines quoting the RPC URL keep neither its key nor its host', async () => {
+    // A missing keypair stops main() after the config loads and before anything touches the network.
+    const libraryWrites = `
+      const url = process.env.RPC_URL
+      process.stderr.write('lib error ' + url + '\\n')
+      console.error('ws error:', url)
+      console.log('request', '${RPC_PATH_AND_QUERY}')
+      process.stdout.write('GET ${RPC_PATH_AND_QUERY}\\n')
+    `
+    const env = { CLUSTER: 'devnet', RPC_URL: SECRET_RPC_URL, CRANK_KEYPAIR: './no-such-keypair.json', CRANK_FORCE_START: '1' }
 
-    const run = await runNode(script, env)
+    const run = await runNode(nodeScript(`${IMPORT_INDEX_SCRIPT}\n${libraryWrites}`), env)
 
     expect(run.code).not.toBe(0)
     expect(run.output).toContain('worker failed to start')
     expect(run.output).toContain('lib error [redacted]')
     expect(run.output).toContain('ws error: [redacted]')
-    expect(run.output).not.toContain(STDERR_SECRET)
-    expect(run.output).not.toContain(STDERR_HOST)
+    expect(run.output).toContain('request [redacted]')
+    expect(run.output).toContain('GET [redacted]')
+    expectNoRpcUrlPart(run.output)
+  }, SPAWN_TIMEOUT_MS)
+
+  it('main() scrubs before loadConfig: a library throwing inside loadConfig with the RPC URL prints no URL path or query', async () => {
+    const env = { CLUSTER: 'devnet', RPC_URL: SECRET_RPC_URL, CRANK_KEYPAIR: HOME_KEYPAIR, CRANK_FORCE_START: '1' }
+
+    const run = await runNode(nodeScript(`${HOMEDIR_FAILS_QUOTING_RPC_URL}\n${IMPORT_INDEX_SCRIPT}`), env)
+
+    expect(run.code).not.toBe(0)
+    expect(run.output).toContain('worker failed to start')
+    expect(run.output).toContain('fetch failed: [redacted]')
+    for (const line of ['lib log [redacted]', 'lib info [redacted]', 'lib debug [redacted]', 'lib warn [redacted]']) {
+      expect(run.output).toContain(line)
+    }
+    expect(run.output).toContain('lib error: [redacted]')
+    expect(run.output).toContain('lib stdout GET [redacted]')
+    expect(run.output).toContain('lib stderr [redacted] [redacted]')
+    expectNoRpcUrlPart(run.output)
+  }, SPAWN_TIMEOUT_MS)
+
+  it('RPC_URL set only in worker/.env is registered as soon as the file loads: a loadConfig error quoting it prints no URL path or query', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'trucee-worker-env-'))
+    try {
+      const tempEnvFile = join(tempDir, '.env')
+      writeFileSync(tempEnvFile, `RPC_URL=${SECRET_RPC_URL}\n`)
+      // No RPC_URL in the process env (runNode drops it): only the .env file sets it.
+      const env = {
+        CLUSTER: 'devnet',
+        CRANK_KEYPAIR: HOME_KEYPAIR,
+        CRANK_FORCE_START: '1',
+        WORKER_ENV_FILE: join(realpathSync(WORKER_DIR), '.env'),
+        TEMP_ENV_FILE: tempEnvFile,
+      }
+      const script = `${WORKER_ENV_FILE_IS_TEMP_ENV}\n${HOMEDIR_FAILS_QUOTING_RPC_URL}\n${IMPORT_INDEX_SCRIPT}`
+
+      const run = await runNode(nodeScript(script), env)
+
+      expect(run.code).not.toBe(0)
+      expect(run.output).toContain('worker failed to start')
+      // loadConfig got as far as os.homedir with the URL from the file, so the throw quotes it.
+      expect(run.output).toContain('fetch failed: [redacted]')
+      expect(run.output).toContain('lib info [redacted]')
+      expect(run.output).toContain('lib stdout GET [redacted]')
+      expectNoRpcUrlPart(run.output)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
   }, SPAWN_TIMEOUT_MS)
 })
 
@@ -281,35 +397,54 @@ describe('protectRpcUrl', () => {
   })
 })
 
-/** Replaces process.stderr.write, console.error and console.warn with recorders of what each is handed. */
-function recordStderr(): { readonly chunks: string[]; readonly restore: () => void } {
-  const chunks: string[] = []
-  const text = (chunk: string | Uint8Array): string => (typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'))
-  const spies = [
-    vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => {
-      chunks.push(text(chunk))
-      return true
-    }),
-    vi.spyOn(console, 'error').mockImplementation((...data: unknown[]) => {
-      chunks.push(data.map(String).join(' '))
-    }),
-    vi.spyOn(console, 'warn').mockImplementation((...data: unknown[]) => {
-      chunks.push(data.map(String).join(' '))
-    }),
-  ]
-  return { chunks, restore: () => spies.forEach((spy) => spy.mockRestore()) }
+const CONSOLE_METHODS = ['log', 'info', 'warn', 'error', 'debug'] as const
+
+interface OutputRecorder {
+  /** The text each writer under the scrub was handed, in order: a stream write's chunk or a console line. */
+  readonly chunks: string[]
+  /** The arguments each process.stdout.write and process.stderr.write under the scrub was called with, in order. */
+  readonly writeCalls: unknown[][]
+  readonly restore: () => void
 }
 
-describe('scrubStderr', () => {
-  /** Undoes, in order, the scrubber and then the recorders under it, so no wrapper outlives its test. */
+/**
+ * Replaces process.stdout.write, process.stderr.write and console.log/info/warn/error/debug with recorders of what each
+ * is handed. A recorded stream write returns `writeResult`.
+ */
+function recordOutput(writeResult = true): OutputRecorder {
+  const chunks: string[] = []
+  const writeCalls: unknown[][] = []
+  const text = (chunk: string | Uint8Array): string => (typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'))
+  const recordWrite = (...args: [chunk: string | Uint8Array, ...rest: unknown[]]): boolean => {
+    writeCalls.push(args)
+    chunks.push(text(args[0]))
+    return writeResult
+  }
+  const spies = [
+    vi.spyOn(process.stdout, 'write').mockImplementation(recordWrite),
+    vi.spyOn(process.stderr, 'write').mockImplementation(recordWrite),
+    ...CONSOLE_METHODS.map((method) =>
+      vi.spyOn(console, method).mockImplementation((...data: unknown[]) => {
+        chunks.push(data.map(String).join(' '))
+      }),
+    ),
+  ]
+  return { chunks, writeCalls, restore: () => spies.forEach((spy) => spy.mockRestore()) }
+}
+
+describe('installOutputScrub', () => {
+  const SECRET = 'plain-secret-0123456789'
+
+  /** Undoes, in order, the scrub and then the recorders under it, so no wrapper outlives its test. */
   let undo: ReadonlyArray<() => void> = []
 
-  /** Records stderr, then installs the scrubber over the recorders for STDERR_RPC_URL. */
-  function scrubbedStderr(): string[] {
-    const recorder = recordStderr()
-    const unscrub = scrubStderr(STDERR_RPC_URL)
+  /** Records every output, then installs the scrub over the recorders with RPC_URL set to SECRET_RPC_URL. */
+  function scrubbedOutput(writeResult = true): OutputRecorder {
+    vi.stubEnv('RPC_URL', SECRET_RPC_URL)
+    const recorder = recordOutput(writeResult)
+    const unscrub = installOutputScrub()
     undo = [unscrub, recorder.restore]
-    return recorder.chunks
+    return recorder
   }
 
   afterEach(() => {
@@ -317,43 +452,114 @@ describe('scrubStderr', () => {
     undo = []
   })
 
-  it('a library writing the RPC URL to stderr: the line written contains neither the key nor the host', () => {
-    const chunks = scrubbedStderr()
+  it('after registerSecret, every console method and both streams print the secret as [redacted]', () => {
+    registerSecret(SECRET)
+    const { chunks } = scrubbedOutput()
 
-    process.stderr.write(`request to ${STDERR_RPC_URL} failed\n`)
+    for (const method of CONSOLE_METHODS) console[method](`${method}:`, `key ${SECRET}`)
+    process.stdout.write(`stdout key ${SECRET}\n`)
+    process.stderr.write(Buffer.from(`stderr key ${SECRET}\n`))
 
-    expect(chunks).toEqual(['request to [redacted] failed\n'])
+    expect(chunks).toEqual([
+      ...CONSOLE_METHODS.map((method) => `${method}: key [redacted]`),
+      'stdout key [redacted]\n',
+      'stderr key [redacted]\n',
+    ])
   })
 
-  it('scrubs a bare key and a Buffer chunk, and keeps the host of any other URL, as the logger does', () => {
-    const chunks = scrubbedStderr()
+  it('scrubs a loaded crank keypair in its JSON-array and base58 forms from every output', () => {
+    const keypair = Keypair.generate()
+    const jsonArray = JSON.stringify(Array.from(keypair.secretKey))
+    const base58 = bs58.encode(keypair.secretKey)
+    loadCrankKeypair(jsonArray)
+    const { chunks } = scrubbedOutput()
 
-    process.stderr.write(Buffer.from(`invalid api key ${STDERR_SECRET}\n`))
-    process.stderr.write('see https://docs.example.org/errors/429?ref=abc\n', 'utf8')
+    console.log('key', jsonArray)
+    console.info(`key ${base58}`)
+    process.stdout.write(`key ${base58}\n`)
+    process.stderr.write(`key ${jsonArray}\n`)
 
-    expect(chunks).toEqual(['invalid api key [redacted]\n', 'see docs.example.org\n'])
+    expect(chunks).toEqual(['key [redacted]', 'key [redacted]', 'key [redacted]\n', 'key [redacted]\n'])
   })
 
-  it('scrubs console.error and console.warn, which @solana/web3.js uses for connection and retry errors', () => {
-    const chunks = scrubbedStderr()
+  it('registers RPC_URL from the env at install: its host, key and bare path and query never print', () => {
+    const { chunks } = scrubbedOutput()
 
-    console.error('ws error:', `connect ECONNREFUSED ${STDERR_RPC_URL}`)
-    console.warn(new Error(`fetch failed: ${STDERR_RPC_URL}`))
+    process.stderr.write(`request to ${SECRET_RPC_URL} failed\n`)
+    process.stdout.write(`GET ${RPC_PATH_AND_QUERY}\n`)
+    console.log('invalid api key', RPC_QUERY_KEY)
+    console.error('ws error:', `connect ECONNREFUSED ${SECRET_RPC_URL}`)
+    console.warn(new Error(`fetch failed: ${SECRET_RPC_URL}`))
 
     const output = chunks.join('\n')
-    expect(chunks[0]).toBe('ws error: connect ECONNREFUSED [redacted]')
+    expect(chunks.slice(0, 4)).toEqual([
+      'request to [redacted] failed\n',
+      // The path and the query are registered as separate parts.
+      'GET [redacted][redacted]\n',
+      'invalid api key [redacted]',
+      'ws error: connect ECONNREFUSED [redacted]',
+    ])
     expect(output).toContain('fetch failed: [redacted]')
-    expect(output).not.toContain(STDERR_SECRET)
-    expect(output).not.toContain(STDERR_HOST)
+    expectNoRpcUrlPart(output)
   })
 
-  it('restores the original stderr writers', () => {
-    const recorder = recordStderr()
+  it('reduces any other URL to its host, as the logger does', () => {
+    const { chunks } = scrubbedOutput()
+
+    process.stderr.write('see https://docs.example.org/errors/429?ref=abc\n', 'utf8')
+    console.log('see', 'https://docs.example.org/errors/429?ref=abc')
+
+    expect(chunks).toEqual(['see docs.example.org\n', 'see docs.example.org'])
+  })
+
+  it('a logger line passes through unchanged apart from its secrets, so it stays one JSON line', () => {
+    registerSecret(SECRET)
+    const { chunks } = scrubbedOutput()
+
+    log.info('ready', { key: SECRET, cluster: 'devnet' })
+
+    expect(chunks).toHaveLength(1)
+    expect(JSON.parse(chunks[0] ?? '')).toMatchObject({ level: 'info', msg: 'ready', key: '[redacted]', cluster: 'devnet' })
+  })
+
+  it('keeps write semantics: the return value, the callback and the encoding; a chunk with nothing to scrub passes as is', () => {
+    registerSecret(SECRET)
+    const { writeCalls } = scrubbedOutput(false)
+    const done = vi.fn()
+    const clean = Buffer.from('plain line\n')
+    const cleanBase64 = Buffer.from('plain bytes').toString('base64')
+
+    const results = [
+      process.stdout.write(clean, done),
+      process.stdout.write('plain text\n'),
+      process.stdout.write(cleanBase64, 'base64', done),
+      process.stderr.write(`key ${SECRET}\n`, 'latin1', done),
+      process.stderr.write(Buffer.from(`key ${SECRET}\n`), done),
+      process.stderr.write(Buffer.from(`key ${SECRET}\n`).toString('base64'), 'base64'),
+    ]
+
+    expect(results).toEqual(Array(results.length).fill(false))
+    expect(writeCalls).toEqual([
+      [clean, done],
+      ['plain text\n'],
+      [cleanBase64, 'base64', done],
+      ['key [redacted]\n', 'latin1', done],
+      ['key [redacted]\n', 'utf8', done],
+      ['key [redacted]\n', 'utf8', undefined],
+    ])
+    expect(writeCalls[0]?.[0]).toBe(clean)
+  })
+
+  it('restores every original writer', () => {
+    const recorder = recordOutput()
     undo = [recorder.restore]
-    const originals = [process.stderr.write, console.error, console.warn]
+    const writers = (): unknown[] => [process.stdout.write, process.stderr.write, ...CONSOLE_METHODS.map((method) => console[method])]
+    const originals = writers()
 
-    scrubStderr(STDERR_RPC_URL)()
+    const unscrub = installOutputScrub()
+    expect(writers().every((writer, i) => writer !== originals[i])).toBe(true)
+    unscrub()
 
-    expect([process.stderr.write, console.error, console.warn]).toEqual(originals)
+    expect(writers()).toEqual(originals)
   })
 })

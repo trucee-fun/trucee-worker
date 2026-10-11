@@ -1,8 +1,9 @@
 /**
  * Worker entrypoint: validates config and the crank keypair, starts the crank loop with every job (CRK-07), stops it
  * on SIGINT/SIGTERM. Each tick runs finalize, migrate, claims and auto-exit in that order, so a graduated market can be
- * finalized, migrated and claimed in one tick (within MAX_TX_PER_TICK). Library output on stderr is scrubbed of the RPC
- * URL like a log line (CRK-13). Importing this module (tests) starts nothing unless CRANK_FORCE_START=1.
+ * finalized, migrated and claimed in one tick (within MAX_TX_PER_TICK). Everything printed on stdout, stderr or the
+ * console is scrubbed of the RPC URL and the crank keypair like a log line, from before the config loads (CRK-13,
+ * CRK-14). Importing this module (tests) starts nothing unless CRANK_FORCE_START=1.
  */
 import { existsSync, realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -13,7 +14,7 @@ import { createAutoExitJob } from './crank/jobs/auto-exit.js'
 import { createClaimsJob } from './crank/jobs/claims.js'
 import { createFinalizeJob } from './crank/jobs/finalize.js'
 import { createMigrateJob } from './crank/jobs/migrate.js'
-import { errorMessage, log, redactUrls, registerSecret } from './log.js'
+import { errorMessage, log, redactUrls, registerSecret, scrubSecrets } from './log.js'
 
 /** worker/.env, if present. Variables already set in the shell take precedence over the file. */
 const ENV_FILE = fileURLToPath(new URL('../.env', import.meta.url))
@@ -31,10 +32,17 @@ const EXIT_FAILURE = 1
 const FORCE_START_ENV = 'CRANK_FORCE_START'
 /** Shorter RPC URL parts are never scrubbed ("/", "v2", an empty query), as in log.ts registerSecret. */
 const MIN_SECRET_LENGTH = 8
-/** What a scrubbed RPC URL part becomes, as in log.ts. */
-const REDACTED = '[redacted]'
+/** The console methods installOutputScrub wraps; any other console output still reaches a scrubbed stream. */
+const CONSOLE_METHODS = ['log', 'info', 'warn', 'error', 'debug'] as const
+/** String encodings that spell bytes rather than text: the scrub reads the bytes such a string writes. */
+const BYTE_ENCODINGS: ReadonlySet<string> = new Set(['hex', 'base64', 'base64url'])
 
 type WriteCallback = (err?: Error | null) => void
+type StreamWrite = (
+  chunk: unknown,
+  encodingOrCallback?: BufferEncoding | WriteCallback,
+  callback?: WriteCallback,
+) => boolean
 
 /**
  * The crank jobs in tick order, each spending within the guards of `cfg` (MIN_ATA_VALUE_LAMPORTS,
@@ -70,39 +78,80 @@ export function protectRpcUrl(rpcUrl: string): void {
   for (const secret of rpcUrlSecrets(rpcUrl)) registerSecret(secret)
 }
 
-/** `text` with every URL reduced to its host, then every part of the RPC URL (its host among them) replaced. */
-function scrubText(text: string, secrets: readonly string[]): string {
-  return secrets.reduce((scrubbed, secret) => scrubbed.split(secret).join(REDACTED), redactUrls(text))
+/**
+ * Registers RPC_URL from `env`, when set, as protectRpcUrl does. A value that is not a URL is registered whole: the
+ * config error that rejects it later must not be what keeps it out of the output.
+ */
+function protectEnvRpcUrl(env: NodeJS.ProcessEnv): void {
+  const rpcUrl = env.RPC_URL
+  if (rpcUrl === undefined || rpcUrl === '') return
+  try {
+    protectRpcUrl(rpcUrl)
+  } catch {
+    registerSecret(rpcUrl)
+  }
+}
+
+/** What any output prints of `text`: as in a log line, every URL reduced to its host, then every secret replaced. */
+function scrubOutput(text: string): string {
+  return scrubSecrets(redactUrls(text))
+}
+
+function isByteEncoding(encoding: string | undefined): encoding is BufferEncoding {
+  return encoding !== undefined && BYTE_ENCODINGS.has(encoding)
 }
 
 /**
- * Scrubs every stderr line of the RPC URL, as the logger scrubs a log line: process.stderr.write, console.error and
- * console.warn (which @solana/web3.js uses for connection and retry errors, and which can quote the URL with its key).
- * Every URL is reduced to its host, then the RPC URL's host, key and other parts become [redacted]. A Buffer chunk is
- * decoded as UTF-8. A URL split across two writes is not matched; console writes each line whole. Install it once at
- * startup; the returned function puts the original writers back.
+ * The text a stream write prints: a string chunk as is, a byte chunk decoded as UTF-8, a string in a byte encoding
+ * (hex, base64) as the bytes it spells, decoded as UTF-8. Undefined for anything else, which the stream itself rejects.
  */
-export function scrubStderr(rpcUrl: string): () => void {
-  const secrets = rpcUrlSecrets(rpcUrl)
-  const scrub = (text: string): string => scrubText(text, secrets)
-  const stderr = process.stderr
-  const original = { write: stderr.write, error: console.error, warn: console.warn }
+function writtenText(chunk: unknown, encoding: string | undefined): string | undefined {
+  if (chunk instanceof Uint8Array) return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength).toString('utf8')
+  if (typeof chunk !== 'string') return undefined
+  return isByteEncoding(encoding) ? Buffer.from(chunk, encoding).toString('utf8') : chunk
+}
 
-  function write(chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | WriteCallback, callback?: WriteCallback): boolean {
-    const isText = typeof chunk === 'string'
-    const encoding = isText && typeof encodingOrCallback === 'string' ? encodingOrCallback : 'utf8'
+/**
+ * `stream.write` through scrubOutput. A chunk with nothing to scrub reaches the stream exactly as given. A scrubbed
+ * chunk is written as text: a string chunk in its own text encoding, anything else as UTF-8. The callback and the
+ * return value are the stream's own.
+ */
+function scrubbedWrite(stream: NodeJS.WriteStream, original: StreamWrite): StreamWrite {
+  return (...args) => {
+    const [chunk, encodingOrCallback, callback] = args
+    const encoding = typeof encodingOrCallback === 'string' ? encodingOrCallback : undefined
+    const text = writtenText(chunk, encoding)
+    const scrubbed = text === undefined ? text : scrubOutput(text)
+    if (scrubbed === text) return original.apply(stream, args)
+    const isTextChunk = typeof chunk === 'string' && !isByteEncoding(encoding)
     const done = typeof encodingOrCallback === 'function' ? encodingOrCallback : callback
-    const text = isText ? chunk : Buffer.from(chunk).toString('utf8')
-    return original.write.call(stderr, scrub(text), encoding, done)
+    return original.call(stream, scrubbed, isTextChunk ? (encoding ?? 'utf8') : 'utf8', done)
   }
+}
 
-  stderr.write = write as typeof stderr.write
-  console.error = (...data: unknown[]) => original.error.call(console, scrub(format(...data)))
-  console.warn = (...data: unknown[]) => original.warn.call(console, scrub(format(...data)))
+/**
+ * Scrubs everything the worker prints, as the logger scrubs a log line: process.stdout.write, process.stderr.write and
+ * console.log/info/warn/error/debug (@solana/web3.js reports connection and retry errors on the console, quoting the
+ * URL with its key). Every URL is reduced to its host, then every registered secret (the RPC URL's parts, the crank
+ * keypair forms of config.ts) becomes [redacted]. RPC_URL from the process env is registered here, so a library
+ * printing during config load is scrubbed too. A secret split across two writes is not matched; the console writes each
+ * line whole. Log lines pass the scrub twice, which changes nothing more. Install it first thing at startup; the
+ * returned function puts the original writers back.
+ */
+export function installOutputScrub(): () => void {
+  protectEnvRpcUrl(process.env)
+  const streams = [process.stdout, process.stderr].map((stream) => ({ stream, write: stream.write }))
+  const consoles = CONSOLE_METHODS.map((method) => ({ method, fn: console[method] }))
+
+  for (const { stream, write } of streams) {
+    stream.write = scrubbedWrite(stream, write as StreamWrite) as typeof stream.write
+  }
+  for (const { method, fn } of consoles) {
+    console[method] = (...data: unknown[]) => fn.call(console, scrubOutput(format(...data)))
+  }
   return () => {
-    stderr.write = original.write
-    console.error = original.error
-    console.warn = original.warn
+    for (const { stream, write } of streams) stream.write = write
+    for (const { method, fn } of consoles) console[method] = fn
   }
 }
 
@@ -154,10 +203,12 @@ function installShutdown(crank: CrankHandle): void {
 }
 
 async function main(): Promise<void> {
+  installOutputScrub()
   loadEnvFile()
+  // An RPC_URL set only in worker/.env: registered before anything (loadConfig among them) can print it.
+  protectEnvRpcUrl(process.env)
   const cfg = loadConfig(process.env)
   protectRpcUrl(cfg.rpcUrl)
-  scrubStderr(cfg.rpcUrl)
   // Loaded here first so a bad keypair fails fast with a clear message before anything starts.
   const payer = loadCrankKeypair(cfg.crankKeypairPath)
   log.info('worker starting', { cluster: cfg.cluster, payer: payer.publicKey.toBase58() })
