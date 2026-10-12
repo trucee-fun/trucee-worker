@@ -59,6 +59,8 @@ For xStock quotes, missing-ATA creation requires a payout of at least `10000000`
 | `claims` | Pays each remaining holder's surplus share to their canonical quote ATA. |
 | `auto-exit` | Executes due, delegated positions before graduation, using the chain clock. |
 
+Mainnet smoke: `RPC_URL=… PAYER_KEYPAIR=/path/to/payer.json APP_BASE_URL=https://trucee.fun npx tsx scripts/mainnet-smoke.ts` runs a read-only preflight; add `--execute` to launch, buy 0.01 SOL and exit before graduation, check the floor until graduation with its 2-lamport haircut, then close wSOL; spend stays under 0.05 SOL, output is `out/mainnet-smoke.json` plus `HIDDEN_MARKETS=<market>`.
+
 ## Devnet scripts
 
 These commands run from `worker/`. Supply `RPC_URL` or `DEVNET_RPC` through the environment; `node --env-file=../litesvm-diff/.env --import tsx scripts/NAME.ts` can load a companion env file. The scripts do not load `worker/.env` themselves. `PAYER_KEYPAIR` defaults to `~/.config/solana/id.json`.
