@@ -1,9 +1,9 @@
 /**
- * Worker entrypoint: validates config and the crank keypair, starts the crank loop with every job (CRK-07), stops it
+ * Worker entrypoint: validates config and the crank keypair, starts the crank loop with every job, stops it
  * on SIGINT/SIGTERM. Each tick runs finalize, migrate, claims and auto-exit in that order, so a graduated market can be
  * finalized, migrated and claimed in one tick (within MAX_TX_PER_TICK). Everything printed on stdout, stderr or the
- * console is scrubbed of the RPC URL and the crank keypair like a log line, from before the config loads (CRK-13,
- * CRK-14). Importing this module (tests) starts nothing unless CRANK_FORCE_START=1.
+ * console is scrubbed of the RPC URL and the crank keypair like a log line, from before the config loads.
+ * Importing this module (tests) starts nothing unless CRANK_FORCE_START=1.
  */
 import { existsSync, realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'

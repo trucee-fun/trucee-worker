@@ -1,5 +1,5 @@
 /**
- * OPS-07: seeds devnet with three Trucee demo markets on router v5, so Discover is never empty:
+ * Seeds devnet with three Trucee demo markets on router v5, so Discover is never empty:
  *   live       a live curve with spread buys and an exit at cost (about 30% curve progress)
  *   hot        a live curve above 70% progress (about 82%)
  *   graduated  a completed curve: router finalize, every position claimed, then migrated to DAMM v2 with the DBC SDK
@@ -13,18 +13,15 @@
  * swap_base_amount) before they are sent. Trader SOL (wallet plus wSOL ATA) is swept back to the payer at the end,
  * also when a step fails. Market base-token ATAs and the positions of the live markets stay: that is the demo data.
  *
- * Migration race (OPS-28): migration_damm_v2 is permissionless, so the hosted crank (or any keeper) may migrate the
+ * Migration race: migration_damm_v2 is permissionless, so the hosted crank (or any keeper) may migrate the
  * graduated pool before this script does. When the pool is already migrated (is_migrated set, or migration_progress
  * CreatedPool), before the send or after a failed one, the migrate step logs 'already migrated', records the
  * migration transaction it finds on the DAMM v2 pool (graduation.migratedByOtherKey) and the run continues. Any other
  * migrate failure still fails the run.
  *
- * Known devnet bug (not handled here): sdk fetchAllMarkets and the crank jobs throw on two legacy 241-byte markets,
- * so this script reads only the markets it creates (fetchMarket) and calls the instruction builders directly.
- *
  * Usage (from worker/, with the app serving /api/metadata; the RPC URL never reaches argv or the output):
  *   RPC_URL="$DEVNET_RPC" npx tsx scripts/seed-devnet.ts
- *   node --env-file=<main checkout>/litesvm-diff/.env --import tsx scripts/seed-devnet.ts
+ *   node --env-file=../litesvm-diff/.env --import tsx scripts/seed-devnet.ts
  *
  * Env:
  *   RPC_URL            devnet RPC endpoint, falls back to DEVNET_RPC (required, never printed). The genesis hash must
@@ -667,7 +664,7 @@ export async function runMigrateStep(pool: PublicKey, deps: MigrateStepDeps): Pr
   }
 }
 
-/** migration_damm_v2 through the DBC SDK, as litesvm-diff/src/migrate_devnet.ts (ONC-10). */
+/** migration_damm_v2 through the DBC SDK, as litesvm-diff/src/migrate_devnet.ts. */
 async function sendMigration(ctx: Ctx, pool: PublicKey, dammConfig: PublicKey): Promise<string> {
   const client = new DynamicBondingCurveClient(ctx.connection, COMMITMENT)
   const migration = await client.migration.migrateToDammV2({ payer: ctx.payer.publicKey, pool, dammConfig })

@@ -1,5 +1,5 @@
 /**
- * CRK-05: the auto-exit crank job. planAutoExits is tested with synthetic decoded accounts; autoExitJob.run with an
+ * The auto-exit crank job. planAutoExits is tested with synthetic decoded accounts; autoExitJob.run with an
  * in-memory Connection fake that serves raw account bytes (Position, Market, DBC pool, Clock sysvar); timeouts run on
  * fake timers.
  */
@@ -54,7 +54,7 @@ import {
   type AtaRule,
 } from '../src/crank/jobs/auto-exit.js'
 
-// decodePosition is wrapped (still the real decoder) so the CRK-11 test can see which accounts the job decodes.
+// decodePosition is wrapped (still the real decoder) so the test can see which accounts the job decodes.
 vi.mock('@trucee/sdk', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@trucee/sdk')>()
   return { ...actual, decodePosition: vi.fn(actual.decodePosition) }
@@ -67,7 +67,7 @@ const BASIS = 1_000_000_000n
 /** A basis whose refund is far below MIN_ATA_VALUE_LAMPORTS (0.25 SOL). */
 const DUST_BASIS = 1_000_000n
 const FUNDED_LAMPORTS = 10_000_000_000
-/** No ATA rent guard: the CRK-05 tests are about exits; the CRK-10 tests pass their own guards. */
+/** No ATA rent guard for basic exit tests; rent-guard tests pass their own guards. */
 const OPEN_GUARDS: CrankGuards = Object.freeze({
   minAtaValueLamports: 0n,
   maxAtaCreatesPerTick: Number.MAX_SAFE_INTEGER,
@@ -370,7 +370,7 @@ describe('planAutoExits', () => {
 const POSITION_DISCRIMINATOR = [170, 188, 143, 228, 122, 64, 247, 208]
 const MARKET_DISCRIMINATOR = [219, 190, 213, 55, 0, 227, 198, 154]
 const POSITION_SIZE = 97
-/** Pre-v5 Positions (no auto-exit deadline) the devnet router still owns (CRK-11). */
+/** Pre-v5 Positions (no auto-exit deadline) the devnet router still owns. */
 const LEGACY_POSITION_SIZE = 89
 const MARKET_SIZE = 274
 const POOL_SIZE = 416

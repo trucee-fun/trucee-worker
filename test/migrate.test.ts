@@ -45,7 +45,7 @@ const CLUSTER = getClusterConfig('localnet')
 /** DAMM_V2_MIGRATION_FEE_ADDRESS[0] (FixedBps25) and [6] (Customizable), from the DBC SDK. */
 const DAMM_CONFIG_FEE_OPTION_0 = '7F6dnUcRuyM2TwR8myT1dYypFXpPSxqwKNSFNkxyNESd'
 const DAMM_CONFIG_FEE_OPTION_6 = 'A8gMrEPJkacWkcb3DGwtJwTe16HktSEfvwtuDh2MCtck'
-/** RSC-03: migration_progress is the byte at offset 308 of a DBC pool account. */
+/** migration_progress is the byte at offset 308 of a DBC pool account. */
 const MIGRATION_PROGRESS_OFFSET = 308
 /** ConfigWithTransferHook (DBC SDK 1.5.13 IDL): config.quote_mint and config.migration_fee_option byte offsets. */
 const CONFIG_QUOTE_MINT_OFFSET = 8

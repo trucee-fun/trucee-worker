@@ -1,5 +1,5 @@
 /**
- * Crank job "claims" (CRK-03): once a market is finalized, claims the surplus share of every remaining position.
+ * Crank job "claims": once a market is finalized, claims the surplus share of every remaining position.
  * claim_surplus is permissionless: the router forces the share into the owner's canonical quote ATA and closes the
  * position to the owner, so the crank gains nothing. It pays the fees, plus the rent of any quote ATA it creates.
  *
@@ -8,7 +8,7 @@
  * attempts at most ctx.maxTx * MAX_ATTEMPTS_PER_TX claims, so positions whose claim keeps failing cost a bounded
  * number of calls per tick.
  *
- * ATA rent guard (CRK-10): an owner can close the ATA the crank paid for and keep its rent, so a missing ATA is created
+ * ATA rent guard: an owner can close the ATA the crank paid for and keep its rent, so a missing ATA is created
  * only when the surplus share reaches its quote mint's minimum (quoteMinimums: wSOL from minAtaValueLamports, xStocks
  * in raw units), and at most maxAtaCreatesPerTick ATAs are created per tick. Any other claim with a missing ATA is
  * skipped (left to the owner) without using the tick's budget. Markets of a quote mint without minimums are skipped.
@@ -73,10 +73,10 @@ const QUOTE_TOKEN_PROGRAMS: readonly PublicKey[] = Object.freeze([TOKEN_PROGRAM_
 const DEFAULT_CLUSTER: ClusterConfig = getClusterConfig('devnet')
 const TIMED_OUT: unique symbol = Symbol('timed out')
 const U64_MAX = (1n << 64n) - 1n
-/** Default minimums of the pure planner: mainnet-beta lists every quote mint, and ATA minimums match on every cluster. */
+/** Default minimums of the pure planning function: mainnet-beta lists every quote mint, and ATA minimums match on every cluster. */
 const DEFAULT_QUOTE_MINIMUMS = quoteMinimums(defaultCrankGuards('mainnet-beta'), getClusterConfig('mainnet-beta').quoteMints)
 
-/* ---------- planner ---------- */
+/* ---------- planning ---------- */
 
 function requireQuoteTokenProgram(program: PublicKey): PublicKey {
   if (!QUOTE_TOKEN_PROGRAMS.some((allowed) => allowed.equals(program))) {
@@ -187,7 +187,7 @@ async function rpc<T>(call: Promise<T>, name: string): Promise<T> {
 
 /**
  * The market's current-layout Positions. The dataSize filter keeps the 89-byte pre-v5 Positions the devnet router
- * still owns out of the scan (CRK-11): the RPC never serves them, so they are never decoded or claimed.
+ * still owns out of the scan: the RPC never serves them, so they are never decoded or claimed.
  */
 function positionFilters(market: PublicKey): GetProgramAccountsFilter[] {
   return [

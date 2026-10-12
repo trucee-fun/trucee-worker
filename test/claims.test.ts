@@ -1,5 +1,5 @@
 /**
- * CRK-03: the claims crank job. planClaims is tested with synthetic decoded accounts; claimsJob.run is tested
+ * The claims crank job. planClaims is tested with synthetic decoded accounts; claimsJob.run is tested
  * against an in-memory fake of the few Connection methods it uses (no network).
  */
 import { Buffer } from 'node:buffer'
@@ -49,8 +49,8 @@ import {
   planClaims,
 } from '../src/crank/jobs/claims.js'
 
-// Wrapped, still the real functions: one test makes claimSurplusInstruction pay the wrong account, and the CRK-11
-// tests record what decodePosition is handed and what fetchAllMarkets returns.
+// Wrapped, still the real functions: one test makes claimSurplusInstruction pay the wrong account, and the
+// legacy-account tests record what decodePosition is handed and what fetchAllMarkets returns.
 vi.mock('@trucee/sdk', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@trucee/sdk')>()
   return {
@@ -74,7 +74,7 @@ const POSITION_DISCRIMINATOR = [170, 188, 143, 228, 122, 64, 247, 208]
 const CLAIM_SURPLUS_DISCRIMINATOR = [195, 35, 205, 205, 177, 146, 141, 62]
 const MARKET_SIZE = 274
 const POSITION_SIZE = 97
-/** Layouts the devnet router still owns (CRK-11): pre-v5 Markets and Positions without the auto-exit deadline. */
+/** Layouts the devnet router still owns: pre-v5 Markets and Positions without the auto-exit deadline. */
 const LEGACY_MARKET_SIZE = 241
 const LEGACY_POSITION_SIZE = 89
 const PUBKEY_SIZE = 32
@@ -85,7 +85,7 @@ const FUNDED_LAMPORTS = 10_000_000_000
 /** Surplus 0.9 SOL over a 3_000 basis snapshot: a 1_000 basis position's share is 0.3 SOL, a 1 basis one's is dust. */
 const SURPLUS_SNAPSHOT = 900_000_000n
 const DUST_BASIS = 1n
-/** No ATA rent guard: the CRK-03 tests are about claims; the CRK-10 tests pass their own guards. */
+/** No ATA rent guard for basic claim tests; rent-guard tests pass their own guards. */
 const OPEN_GUARDS: CrankGuards = Object.freeze({
   minAtaValueLamports: 0n,
   maxAtaCreatesPerTick: Number.MAX_SAFE_INTEGER,
@@ -999,7 +999,7 @@ describe('claimsJob ATA rent and payer guards (CRK-10)', () => {
 })
 
 /*
- * CRK-11: the devnet router still owns 241-byte Markets and 89-byte pre-v5 Positions. The fake RPC applies dataSize
+ * The devnet router still owns 241-byte Markets and 89-byte pre-v5 Positions. The fake RPC applies dataSize
  * filters like a node, so only a scan that sends one is spared the legacy accounts.
  */
 describe('claimsJob with legacy-size router accounts (CRK-11)', () => {

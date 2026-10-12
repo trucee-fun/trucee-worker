@@ -1,8 +1,8 @@
 /**
- * CRK-07: the worker entrypoint registers every crank job, in tick order, with the guards of its env config; it never
+ * The worker entrypoint registers every crank job, in tick order, with the guards of its env config; it never
  * exits as a silent no-op when started; and it scrubs every part of the RPC URL that could carry the API key.
- * CRK-13: finalize gets the env guards too, and library output on stderr is scrubbed like a log line.
- * CRK-14: one scrub covers stdout, stderr and every console method, and main() installs it before the config loads.
+ * Finalize gets the env guards too, and library output on stderr is scrubbed like a log line.
+ * One scrub covers stdout, stderr and every console method, and main() installs it before the config loads.
  */
 import { execFile } from 'node:child_process'
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'

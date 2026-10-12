@@ -4,8 +4,8 @@
  * and never the RPC URL.
  *
  * Usage (from worker/; the URL only reaches this process, never argv or your shell):
- *   node --env-file=<main checkout>/litesvm-diff/.env --import tsx scripts/devnet-balance.ts
- *   (set -a; . <main checkout>/litesvm-diff/.env; set +a; RPC_URL="$DEVNET_RPC" npx tsx scripts/devnet-balance.ts)
+ *   node --env-file=../litesvm-diff/.env --import tsx scripts/devnet-balance.ts
+ *   (set -a; . ../litesvm-diff/.env; set +a; RPC_URL="$DEVNET_RPC" npx tsx scripts/devnet-balance.ts)
  *
  * Env:
  *   RPC_URL        RPC endpoint, falls back to DEVNET_RPC (required, never printed). Must be https,
@@ -44,7 +44,7 @@ const NATIVE_MINT = new PublicKey('So11111111111111111111111111111111111111112')
 interface Wallet {
   readonly source: string
   readonly owner: PublicKey
-  /** sweep_traders.ts closes this account too, so its lamports are recoverable. */
+  /** reclaim_test_wallets.ts closes this account too, so its lamports are recoverable. */
   readonly wsolAta: PublicKey
 }
 

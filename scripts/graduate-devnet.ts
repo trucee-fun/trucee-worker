@@ -1,5 +1,5 @@
 /**
- * CRK-07: prepares a graduated-but-unfinalized router v5 market on devnet for an unattended crank run, then records
+ * Prepares a graduated-but-unfinalized router v5 market on devnet for an unattended crank run, then records
  * that run and sweeps the traders. Three modes, run in this order (from worker/; the RPC URL never reaches argv or
  * the output):
  *
@@ -14,7 +14,7 @@
  *   3. RPC_URL="$DEVNET_RPC" CLUSTER=devnet npx tsx scripts/graduate-devnet.ts --sweep
  *      Counts this market's remaining positions and returns every trader's SOL (wallet and wSOL ATA) to the payer.
  *
- * Built from QA-02's scripts/e2e-devnet.ts: devnet genesis-hash check before any key is loaded, RPC URL scrubbed from
+ * Built from scripts/e2e-devnet.ts: devnet genesis-hash check before any key is loaded, RPC URL scrubbed from
  * all output, payer floor of 5 SOL, trader keys written to out/graduate-devnet.traders.json (mode 0600, gitignored)
  * before any is funded and reused (never overwritten) when present, and on a failed graduation every position exits at
  * cost and the traders are swept (try/finally). Everything is recorded in out/crank-run-devnet.json.
@@ -61,7 +61,7 @@ const TRADER_COUNT = 6
 const BPS = 10_000n
 /** zpvp_router ANTI_WHALE_BPS: one position may hold at most 20% of the config's swap_base_amount. */
 const ANTI_WHALE_BPS = 2_000n
-/** Spread buy size, as OPS-07 and QA-02: 40 chunks fill the curve. */
+/** Spread buy size: 40 chunks fill the curve. */
 const BUY_CHUNK = MIGRATION_QUOTE_THRESHOLD / 40n
 const PERCENT = 100n
 /** Buys accept at most 1% less than quoted (only this script trades its fresh market). */
@@ -190,7 +190,7 @@ async function neverLanded(ctx: Ctx, label: string, signature: string): Promise<
   return value === null
 }
 
-/** Sends with the payer as fee payer; resends only an expired transaction that never landed (as OPS-07). */
+/** Sends with the payer as fee payer; resends only an expired transaction that never landed (as the seed script). */
 async function send(ctx: Ctx, label: string, instructions: readonly TransactionInstruction[], signers: readonly Keypair[]): Promise<string> {
   for (let attempt = 1; attempt <= LIMITS.sendAttempts; attempt++) {
     const { tx, latest } = await signed(ctx, instructions, signers)

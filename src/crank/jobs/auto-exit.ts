@@ -1,12 +1,12 @@
 /**
  * Crank job: exits, at cost, every position whose Auto-Exit deadline has passed while its curve is still live
- * (router `auto_exit`, ONC-12). The router compares the deadline with Clock.unix_timestamp, so "now" comes from the
+ * (router `auto_exit`). The router compares the deadline with Clock.unix_timestamp, so "now" comes from the
  * Clock sysvar, never from the local wall clock.
  *
  * planAutoExits is pure: one transaction per due position, the most overdue first. It is [auto_exit] when the owner's
  * canonical quote ATA exists, else [create that ATA (idempotent, paid by the crank), auto_exit].
  *
- * ATA rent guard (CRK-10): an owner can close the ATA the crank paid for and keep its rent, so a missing ATA is created
+ * ATA rent guard: an owner can close the ATA the crank paid for and keep its rent, so a missing ATA is created
  * only when the refund reaches its quote mint's minimum (quoteMinimums: wSOL from minAtaValueLamports, xStocks in raw
  * units), and at most maxAtaCreatesPerTick ATAs are created per tick. Any other exit with a missing ATA is skipped (left
  * to the owner) without using the tick's budget. Positions of a quote mint without minimums are skipped. While the payer
@@ -80,7 +80,7 @@ const BLOCKHASH_NOT_FOUND = 'BlockhashNotFound'
 const BLOCKHASH_NOT_FOUND_MESSAGE = /blockhash not found/i
 
 /**
- * The planner takes no cluster: the router, hook and DBC ids are the same SDK constants on every cluster, and
+ * The instruction builder takes no cluster: the router, hook and DBC ids are the same SDK constants on every cluster, and
  * mainnet-beta lists every quote mint the router allows (devnet's SOL included). run() checks ctx.cluster agrees.
  */
 const PLAN_CLUSTER: ClusterConfig = getClusterConfig('mainnet-beta')
@@ -94,11 +94,11 @@ const POSITION_FILTER: GetProgramAccountsFilter = Object.freeze({
 })
 /**
  * Current-layout Positions only. The 89-byte pre-v5 Positions the devnet router still owns (no deadline field) are
- * never served, so they are never decoded (CRK-11).
+ * never served, so they are never decoded.
  */
 const POSITION_SIZE_FILTER: GetProgramAccountsFilter = Object.freeze({ dataSize: POSITION_ACCOUNT_SIZE_V2 })
 
-/** What the planner knows about owners' quote ATAs and the crank minimums of each quote mint. */
+/** Inputs describing owners' quote ATAs and the crank minimums of each quote mint. */
 export interface AtaRule {
   /** Canonical owner quote ATA (base58) to whether it is a live token account; an absent ATA counts as missing. */
   readonly ownerQuoteAtaExists: ReadonlyMap<string, boolean>
@@ -136,7 +136,7 @@ interface ExitTarget {
   readonly minAtaValue: bigint
 }
 
-/* ---------- planner (pure) ---------- */
+/* ---------- pure planning ---------- */
 
 function hasDeadline(position: PositionAccount): boolean {
   return position.autoExitDeadline !== null && position.autoExitDeadline > AUTO_EXIT_DISABLED
@@ -288,7 +288,7 @@ interface Fetched<T> {
 function requirePlanPrograms(cluster: ClusterConfig): void {
   const differing = PROGRAM_ID_FIELDS.filter((field) => !cluster[field].equals(PLAN_CLUSTER[field]))
   if (differing.length > 0) {
-    throw new Error(`cluster ${cluster.cluster} uses other ${differing.join(', ')} than the SDK constants the planner uses`)
+    throw new Error(`cluster ${cluster.cluster} uses other ${differing.join(', ')} than the SDK constants the instruction builder uses`)
   }
 }
 

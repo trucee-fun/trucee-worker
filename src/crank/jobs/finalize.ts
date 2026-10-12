@@ -4,7 +4,7 @@
  * A market is due while its Market account is unfinalized and its pool's migration_progress is not PreBondingCurve;
  * once finalize confirms, the market reads finalized and drops out of the plan.
  *
- * Guard (CRK-13, as CRK-10 for the other jobs): it plans nothing while the payer holds less than crankMinSolLamports.
+ * Guard: it plans nothing while the payer holds less than crankMinSolLamports.
  */
 import {
   TransactionMessage,
@@ -52,7 +52,7 @@ type SendOutcome =
   | { readonly ok: true; readonly signature: string }
   | { readonly ok: false; readonly error: string }
 
-/* ---------- planner ---------- */
+/* ---------- planning ---------- */
 
 function isDue(market: MarketAccount, poolProgress: ReadonlyMap<string, number>): boolean {
   if (market.finalized) return false

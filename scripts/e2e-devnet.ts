@@ -1,8 +1,9 @@
 /**
- * QA-02: SDK-driven devnet E2E of the full M1 money journey on router v5 (docs/frontend-plan.md §Milestones, M1).
+ * SDK-driven devnet E2E from market launch through graduation and surplus claims on router v5.
  * Every run launches a fresh wSOL market (threshold 0.3 SOL) and walks it from launch to surplus claim: launch (1),
- * seven wrapped buys whose quoteBuy matches each BuyEvent (2), "Your floor" == the refund of a later full exit (3), a
- * half exit at cost == quoteExit (4), hook rejections 6000 of a direct DBC buy and a wallet transfer (5), Anti-Whale
+ * seven wrapped buys whose quoteBuy matches each BuyEvent (2), the floor until graduation equals a full refund
+ * before graduation (basis minus fee at cost minus the 2-lamport haircut) (3), a half exit before graduation equals
+ * quoteExit (4), hook rejections 6000 of a direct DBC buy and a wallet transfer (5), Anti-Whale
  * rejection 6022 (6), Auto-Exit by the real autoExitJob (7), graduation under the cap with the hook revoked (8), the
  * real finalizeJob (9), migrateJob to DAMM v2 (10) and claimsJob (11), a plain transfer after graduation (12) and the
  * sweep of every trader's SOL (13). Each step prints a PASS or FAIL line; the last line is "<p> passed, <f> failed".
@@ -12,13 +13,13 @@
  * Crank jobs run one tick at a time on a connection scoped to this market (scopeToMarket): finalizeJob, createClaimsJob
  * and createAutoExitJob scan every router market or position and take no market filter, so their router scans return
  * only this market and its positions; createMigrateJob also gets a listMarkets override. Every signature a job sends
- * must touch this market or its pool. Traders follow OPS-07 (scripts/seed-devnet.ts): keys go to
+ * must touch this market or its pool. Traders follow scripts/seed-devnet.ts: keys go to
  * out/e2e-devnet.traders.json (mode 0600, gitignored) before any is funded and an existing file is reused, never
  * overwritten; the payer pays every fee and tops a trader up per buy; buys are pre-checked against the cap.
  *
  * Usage (from worker/; the RPC URL never reaches argv or the output):
  *   RPC_URL="$DEVNET_RPC" npx tsx scripts/e2e-devnet.ts > out/e2e-devnet.log 2>&1
- *   node --env-file=<main checkout>/litesvm-diff/.env --import tsx scripts/e2e-devnet.ts > out/e2e-devnet.log 2>&1
+ *   node --env-file=../litesvm-diff/.env --import tsx scripts/e2e-devnet.ts > out/e2e-devnet.log 2>&1
  * Env: RPC_URL (falls back to DEVNET_RPC; must answer with devnet's genesis hash), PAYER_KEYPAIR (default
  * ~/.config/solana/id.json). Output: out/e2e-devnet.json (accounts and signatures per step). Exit 0 when 0 failed.
  */
@@ -76,7 +77,7 @@ const TRADER_COUNT = 7
 const BPS = 10_000n
 /** zpvp_router ANTI_WHALE_BPS: one position may hold at most 20% of the config's swap_base_amount. */
 const ANTI_WHALE_BPS = 2_000n
-/** Spread buy size, as OPS-07: 40 chunks fill the curve. */
+/** Spread buy size: 40 chunks fill the curve. */
 const BUY_CHUNK = MIGRATION_QUOTE_THRESHOLD / 40n
 const PERCENT = 100n
 /** Buys accept at most 1% less than quoted (only this run trades its fresh market). */
@@ -239,7 +240,7 @@ async function neverLanded(ctx: Ctx, label: string, signature: string): Promise<
   return value === null
 }
 
-/** Sends with the payer as fee payer; resends only an expired transaction that never landed (as OPS-07). */
+/** Sends with the payer as fee payer; resends only an expired transaction that never landed (as the seed script). */
 async function send(ctx: Ctx, label: string, instructions: readonly TransactionInstruction[], signers: readonly Keypair[]): Promise<string> {
   for (let attempt = 1; attempt <= LIMITS.sendAttempts; attempt++) {
     const { tx, latest } = await signed(ctx, instructions, signers)

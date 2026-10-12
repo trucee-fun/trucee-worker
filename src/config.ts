@@ -18,7 +18,7 @@ const CLUSTERS = ['devnet', 'mainnet-beta', 'localnet'] as const
 export type WorkerCluster = (typeof CLUSTERS)[number]
 
 /**
- * Spending guards of the crank jobs (CRK-10). The crank pays the rent (~0.002 SOL) of every owner quote ATA it creates,
+ * Spending guards of the crank jobs. The crank pays the rent (~0.002 SOL) of every owner quote ATA it creates,
  * and an owner can close that ATA and keep the rent, so ATA creation is capped by value and per tick.
  */
 export interface CrankGuards {
